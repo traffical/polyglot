@@ -31,7 +31,7 @@ mod function_registry;
 #[cfg(feature = "generate")]
 pub mod generator;
 pub mod guard;
-#[cfg(feature = "semantic")]
+#[cfg(any(feature = "semantic", feature = "transpile"))]
 pub mod helper;
 #[cfg(feature = "semantic")]
 pub mod lineage;
