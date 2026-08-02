@@ -36,6 +36,59 @@ fn generate_tsql(expr: &Expression) -> String {
 }
 
 #[test]
+fn issue_376_tsql_and_fabric_accept_sampling_words_as_implicit_table_aliases() {
+    for dialect_type in [DialectType::TSQL, DialectType::Fabric] {
+        let dialect = Dialect::get(dialect_type);
+        let tokens = dialect
+            .tokenize("SELECT seed.col1, repeatable.col2 FROM my_table seed")
+            .unwrap_or_else(|error| panic!("{dialect_type:?} tokenization failed: {error}"));
+
+        for token in tokens.iter().filter(|token| {
+            token.text.eq_ignore_ascii_case("seed") || token.text.eq_ignore_ascii_case("repeatable")
+        }) {
+            assert_eq!(
+                token.token_type,
+                TokenType::Var,
+                "{dialect_type:?} should tokenize {:?} contextually",
+                token.text
+            );
+        }
+
+        for alias in ["seed", "repeatable"] {
+            let sql = format!("SELECT {alias}.col1 FROM my_table {alias}");
+            assert_eq!(
+                transpile(&sql, dialect_type, dialect_type)
+                    .unwrap_or_else(|error| panic!("{dialect_type:?} failed for {sql:?}: {error}")),
+                [format!("SELECT {alias}.col1 FROM my_table AS {alias}")]
+            );
+        }
+    }
+
+    parse("SELECT seed.col1 FROM table seed", DialectType::TSQL)
+        .expect("the exact issue #376 query should parse as T-SQL");
+}
+
+#[test]
+fn issue_376_contextual_alias_fix_preserves_tsql_table_sample_seeds() {
+    for (sql, expected) in [
+        (
+            "SELECT * FROM my_table TABLESAMPLE SYSTEM (10 PERCENT) REPEATABLE (42)",
+            "SELECT * FROM my_table TABLESAMPLE SYSTEM (10 PERCENT) REPEATABLE (42)",
+        ),
+        (
+            "SELECT * FROM my_table TABLESAMPLE SYSTEM (10 PERCENT) SEED (42)",
+            "SELECT * FROM my_table TABLESAMPLE SYSTEM (10 PERCENT) REPEATABLE (42)",
+        ),
+    ] {
+        assert_eq!(
+            transpile(sql, DialectType::TSQL, DialectType::TSQL)
+                .unwrap_or_else(|error| panic!("T-SQL table sample failed for {sql:?}: {error}")),
+            [expected]
+        );
+    }
+}
+
+#[test]
 fn postgres_json_operators_map_to_valid_tsql_json_functions() {
     let cases = [
         (
@@ -342,13 +395,64 @@ fn postgres_math_and_string_functions_map_to_tsql_semantics() {
             "SELECT LOWER(CONVERT(VARCHAR(MAX), CAST('abc' AS VARBINARY(MAX)), 2))",
         ),
         (
+            "SELECT encode('\\x1234567890abcdef00'::bytea, 'hex')",
+            "SELECT LOWER(CONVERT(VARCHAR(MAX), CAST(0x1234567890abcdef00 AS VARBINARY(MAX)), 2))",
+        ),
+        (
             "SELECT to_number('123.45', '999.99')",
             "SELECT TRY_CONVERT(DECIMAL(18, 2), '123.45')",
+        ),
+        (
+            "SELECT to_number('7.25', 'FM9.99')",
+            "SELECT TRY_CONVERT(DECIMAL(18, 2), '7.25')",
+        ),
+        (
+            "SELECT to_number('123', '999')",
+            "SELECT TRY_CONVERT(DECIMAL(18, 0), '123')",
         ),
     ];
 
     for (sql, expected) in cases {
         assert_eq!(pg_to_tsql_strict(sql), expected, "failed for {sql}");
+    }
+}
+
+#[test]
+fn postgres_bytea_hex_literals_map_to_tsql_binary_literals() {
+    let cases = [
+        ("SELECT '\\x'::bytea", "SELECT 0x"),
+        ("SELECT '\\x1234'::bytea", "SELECT 0x1234"),
+        ("SELECT '\\xDE AD BE EF'::bytea", "SELECT 0xDEADBEEF"),
+        (
+            "SELECT set_bit('\\x1234567890abcdef00'::bytea, 43, 0);",
+            "SELECT SET_BIT(0x1234567890abcdef00, 43, 0)",
+        ),
+        (
+            "SELECT '\\x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f'::bytea",
+            "SELECT 0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        assert_eq!(pg_to_tsql_strict(sql), expected, "failed for {sql}");
+    }
+}
+
+#[test]
+fn postgres_unsafe_bytea_literal_forms_fail_for_tsql_in_strict_mode() {
+    for sql in [
+        "SELECT '\\x1'::bytea",
+        "SELECT '\\x1 2'::bytea",
+        "SELECT '\\001\\134'::bytea",
+    ] {
+        let err = Dialect::get(DialectType::PostgreSQL)
+            .transpile_with(sql, DialectType::TSQL, TranspileOptions::strict())
+            .expect_err("strict mode should reject unsafe PostgreSQL bytea literals");
+
+        assert!(
+            err.to_string().contains("bytea"),
+            "unexpected error for {sql}: {err}"
+        );
     }
 }
 
@@ -456,6 +560,31 @@ fn postgres_math_functions_without_tsql_equivalent_fail_in_strict_mode() {
         assert!(
             err.to_string().contains(expected),
             "unexpected error for {sql}: {err}"
+        );
+    }
+}
+
+#[test]
+fn postgres_to_number_grouping_and_space_masks_do_not_lower_to_try_convert_for_tsql() {
+    let cases = [
+        "SELECT to_number('34,50', '999,99')",
+        "SELECT to_number('5 4 4 4 4 8 . 7 8', '9 9 9 9 9 9 . 9 9')",
+    ];
+
+    for sql in cases {
+        let err = Dialect::get(DialectType::PostgreSQL)
+            .transpile_with(sql, DialectType::TSQL, TranspileOptions::strict())
+            .expect_err("strict mode should reject unsupported TO_NUMBER format masks");
+
+        assert!(
+            err.to_string().contains("TO_NUMBER"),
+            "unexpected error for {sql}: {err}"
+        );
+
+        let best_effort = pg_to_tsql(sql);
+        assert!(
+            best_effort.contains("TO_NUMBER") && !best_effort.contains("TRY_CONVERT"),
+            "unsupported format mask was lowered unsafely for {sql}: {best_effort}"
         );
     }
 }
@@ -1385,10 +1514,25 @@ fn postgres_parenthesized_lateral_joins_map_to_tsql_apply() {
             "SELECT * FROM (orders o LEFT JOIN LATERAL (SELECT 1 AS x) a ON true)",
             "SELECT * FROM (orders AS o OUTER APPLY (SELECT 1 AS x) AS a)",
         ),
+        (
+            concat!(
+                "SELECT * FROM ((int8_tbl t1 LEFT JOIN int8_tbl t2 ON true) ",
+                "LEFT JOIN LATERAL (SELECT * FROM int8_tbl t3 WHERE t3.q1 = t2.q1 OFFSET 0) s ON t2.q1 = 1)"
+            ),
+            concat!(
+                "SELECT * FROM ((int8_tbl AS t1 LEFT JOIN int8_tbl AS t2 ON (1 = 1)) ",
+                "OUTER APPLY (SELECT * FROM (SELECT * FROM int8_tbl AS t3 WHERE t3.q1 = t2.q1) ",
+                "AS _polyglot_lateral_source WHERE t2.q1 = 1) AS s)"
+            ),
+        ),
     ];
 
     for (sql, expected) in cases {
-        assert_eq!(pg_to_tsql(sql), expected, "failed for {sql}");
+        for generated in [pg_to_tsql(sql), pg_to_tsql_strict(sql)] {
+            assert_eq!(generated, expected, "failed for {sql}");
+            parse(&generated, DialectType::TSQL)
+                .unwrap_or_else(|error| panic!("generated T-SQL did not reparse: {error}"));
+        }
     }
 }
 
@@ -1753,16 +1897,104 @@ fn postgres_row_value_equality_subquery_rewrites_in_predicate_contexts_for_tsql(
     let out = pg_to_tsql_strict("SELECT f1 FROM t WHERE ROW(f1, f2) = (SELECT a, b FROM t2)");
     assert_eq!(
         out,
-        "SELECT f1 FROM t WHERE EXISTS(SELECT 1 FROM t2 WHERE t2.a = t.f1 AND t2.b = t.f2)"
+        "SELECT f1 FROM t WHERE CAST((SELECT CASE WHEN _polyglot_row._polyglot_row_value_1 = f1 AND _polyglot_row._polyglot_row_value_2 = f2 THEN 1 WHEN _polyglot_row._polyglot_row_value_1 <> f1 OR _polyglot_row._polyglot_row_value_2 <> f2 THEN 0 ELSE NULL END FROM (SELECT a, b FROM t2) AS _polyglot_row(_polyglot_row_value_1, _polyglot_row_value_2)) AS BIT) <> 0"
     );
 }
 
 #[test]
-fn postgres_row_value_equality_subquery_rewrites_inside_scalar_boolean_for_tsql() {
-    let out = pg_to_tsql_strict("SELECT ROW(1, 2) = (SELECT f1, f2) AS eq FROM t");
-    assert_eq!(
-        out,
-        "SELECT CAST(CASE WHEN EXISTS(SELECT 1 WHERE f1 = 1 AND f2 = 2) THEN 1 ELSE 0 END AS BIT) AS eq FROM t"
+fn postgres_row_value_equality_issue_271_examples_preserve_three_valued_semantics_for_tsql() {
+    let cases = [
+        (
+            "SELECT ROW(1, 2) = (SELECT 3, 4) AS eq FROM subselect_tbl;",
+            "SELECT CAST((SELECT CASE WHEN _polyglot_row._polyglot_row_value_1 = 1 AND _polyglot_row._polyglot_row_value_2 = 2 THEN 1 WHEN _polyglot_row._polyglot_row_value_1 <> 1 OR _polyglot_row._polyglot_row_value_2 <> 2 THEN 0 ELSE NULL END FROM (SELECT 3, 4) AS _polyglot_row(_polyglot_row_value_1, _polyglot_row_value_2)) AS BIT) AS eq FROM subselect_tbl",
+        ),
+        (
+            "SELECT ROW(1, 2) = (SELECT f1, f2) AS eq FROM subselect_tbl;",
+            "SELECT CAST((SELECT CASE WHEN _polyglot_row._polyglot_row_value_1 = 1 AND _polyglot_row._polyglot_row_value_2 = 2 THEN 1 WHEN _polyglot_row._polyglot_row_value_1 <> 1 OR _polyglot_row._polyglot_row_value_2 <> 2 THEN 0 ELSE NULL END FROM (SELECT f1, f2) AS _polyglot_row(_polyglot_row_value_1, _polyglot_row_value_2)) AS BIT) AS eq FROM subselect_tbl",
+        ),
+    ];
+
+    for (sql, expected) in cases {
+        assert_eq!(pg_to_tsql_strict(sql), expected, "failed for {sql}");
+    }
+}
+
+#[test]
+fn postgres_row_value_equality_preserves_zero_and_multiple_row_cardinality_for_tsql() {
+    let zero_rows = pg_to_tsql_strict(
+        "SELECT ROW(1, 2) = (SELECT f1, f2 FROM subselect_tbl WHERE FALSE) AS eq",
+    );
+    assert!(zero_rows.contains("ELSE NULL END"), "{zero_rows}");
+    assert!(
+        zero_rows
+            .contains("FROM (SELECT f1, f2 FROM subselect_tbl WHERE (1 = 0)) AS _polyglot_row"),
+        "{zero_rows}"
+    );
+    assert!(!zero_rows.contains("EXISTS"), "{zero_rows}");
+
+    let potentially_multiple_rows =
+        pg_to_tsql_strict("SELECT ROW(1, 2) = (SELECT f1, f2 FROM subselect_tbl) AS eq");
+    assert!(
+        potentially_multiple_rows
+            .contains("FROM (SELECT f1, f2 FROM subselect_tbl) AS _polyglot_row"),
+        "{potentially_multiple_rows}"
+    );
+    assert!(!potentially_multiple_rows.contains("EXISTS"));
+}
+
+#[test]
+fn postgres_row_value_equality_handles_nulls_aliases_and_query_modifiers_for_tsql() {
+    let null_component = pg_to_tsql_strict("SELECT ROW(1, NULL) = (SELECT 1, 2) AS eq");
+    assert!(
+        null_component.contains(
+            "_polyglot_row._polyglot_row_value_1 = 1 AND \
+             _polyglot_row._polyglot_row_value_2 = NULL THEN 1"
+        ),
+        "{null_component}"
+    );
+    assert!(
+        null_component.contains(
+            "_polyglot_row._polyglot_row_value_1 <> 1 OR \
+             _polyglot_row._polyglot_row_value_2 <> NULL THEN 0 ELSE NULL END"
+        ),
+        "{null_component}"
+    );
+    assert!(!null_component.contains("EXISTS"), "{null_component}");
+
+    let alias_collision = pg_to_tsql_strict(
+        "SELECT ROW(_polyglot_row._polyglot_row_value_1, _polyglot_row.f2) = \
+         (SELECT 1, 2) AS eq FROM subselect_tbl AS _polyglot_row",
+    );
+    assert!(
+        alias_collision.contains(
+            "FROM (SELECT 1, 2) AS \
+             _polyglot_row_2(_polyglot_row_value_1_2, _polyglot_row_value_2)"
+        ),
+        "{alias_collision}"
+    );
+    assert!(
+        alias_collision.contains(
+            "_polyglot_row_2._polyglot_row_value_1_2 = \
+             _polyglot_row._polyglot_row_value_1"
+        ),
+        "{alias_collision}"
+    );
+    assert!(
+        alias_collision.contains("FROM subselect_tbl AS _polyglot_row"),
+        "{alias_collision}"
+    );
+
+    let query_modifiers = pg_to_tsql_strict(
+        "SELECT ROW(1, 2) = \
+         (SELECT f1, f2 FROM subselect_tbl ORDER BY f1 LIMIT 1) AS eq",
+    );
+    assert!(
+        query_modifiers.contains(
+            "FROM (SELECT TOP 1 f1, f2 FROM subselect_tbl ORDER BY \
+             CASE WHEN f1 IS NULL THEN 1 ELSE 0 END, f1) AS \
+             _polyglot_row(_polyglot_row_value_1, _polyglot_row_value_2)"
+        ),
+        "{query_modifiers}"
     );
 }
 
@@ -2690,25 +2922,76 @@ fn any_eq_ruleutils_outer_array_cast_rewrites_to_in() {
 }
 
 #[test]
-fn any_neq_array_not_rewritten() {
-    let out = pg_to_tsql("SELECT * FROM t WHERE col <> ANY(ARRAY['a', 'b'])");
-    assert_eq!(out, "SELECT * FROM t WHERE col <> ANY(ARRAY['a', 'b'])");
-}
+fn issue_382_postgres_scalar_array_quantifiers_lower_to_tsql_predicates() {
+    let cases = [
+        (
+            "SELECT id FROM t WHERE (id = ANY (ARRAY[1, 2, 3]))",
+            "SELECT id FROM t WHERE (id IN (1, 2, 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id <> ANY (ARRAY[1, NULL, 3]))",
+            "SELECT id FROM t WHERE ((id <> 1 OR id <> NULL OR id <> 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id < ANY (ARRAY[1, 2, 3]))",
+            "SELECT id FROM t WHERE ((id < 1 OR id < 2 OR id < 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id <= ANY (ARRAY[1, 2, 3]))",
+            "SELECT id FROM t WHERE ((id <= 1 OR id <= 2 OR id <= 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id > ANY (ARRAY[1, 2, 3]))",
+            "SELECT id FROM t WHERE ((id > 1 OR id > 2 OR id > 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id >= ANY (ARRAY[1, 2, 3]))",
+            "SELECT id FROM t WHERE ((id >= 1 OR id >= 2 OR id >= 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id = ALL (ARRAY[1, 2, 3]))",
+            "SELECT id FROM t WHERE ((id = 1 AND id = 2 AND id = 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id <> ALL (ARRAY[1, 2, 3]))",
+            "SELECT id FROM t WHERE (id NOT IN (1, 2, 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id < ALL (ARRAY[1, 2, 3]))",
+            "SELECT id FROM t WHERE ((id < 1 AND id < 2 AND id < 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id <= ALL (ARRAY[1, 2, 3]))",
+            "SELECT id FROM t WHERE ((id <= 1 AND id <= 2 AND id <= 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id > ALL (ARRAY[1, 2, 3]))",
+            "SELECT id FROM t WHERE ((id > 1 AND id > 2 AND id > 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id >= ALL (ARRAY[1, 2, 3]))",
+            "SELECT id FROM t WHERE ((id >= 1 AND id >= 2 AND id >= 3))",
+        ),
+        (
+            "SELECT id FROM t WHERE (s <> ALL (ARRAY['a'::text, 'b'::text]))",
+            "SELECT id FROM t WHERE (s NOT IN (CAST('a' AS VARCHAR(MAX)), CAST('b' AS VARCHAR(MAX))))",
+        ),
+        (
+            "SELECT id FROM t WHERE (id < ANY (ARRAY[]::int[]))",
+            "SELECT id FROM t WHERE (1 = 0)",
+        ),
+        (
+            "SELECT id FROM t WHERE (id = ALL (ARRAY[]::int[]))",
+            "SELECT id FROM t WHERE (1 = 1)",
+        ),
+    ];
 
-#[test]
-fn strict_any_neq_array_rejects_non_subquery_rhs() {
-    let pg = Dialect::get(DialectType::PostgreSQL);
-    let err = pg
-        .transpile_with(
-            "SELECT * FROM t WHERE col <> ANY(ARRAY['a', 'b'])",
-            DialectType::TSQL,
-            TranspileOptions::strict(),
-        )
-        .expect_err("strict T-SQL transpilation should reject ANY over array literals");
-
-    assert!(err
-        .to_string()
-        .contains("ANY over non-subquery expressions"));
+    for (sql, expected) in cases {
+        assert_eq!(pg_to_tsql(sql), expected, "default failed for {sql}");
+        assert_eq!(pg_to_tsql_strict(sql), expected, "strict failed for {sql}");
+        parse(expected, DialectType::TSQL)
+            .unwrap_or_else(|error| panic!("generated T-SQL failed to parse for {sql:?}: {error}"));
+    }
 }
 
 #[test]

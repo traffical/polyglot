@@ -4,6 +4,55 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.6.3] - 2026-08-02
+
+### Added
+- Oracle data types now have structured parsing and generation for numeric,
+  character, temporal, interval, large-object, raw, and row-identifier types,
+  including precision, scale, length semantics, and time-zone qualifiers.
+  Compatible mappings are available for PostgreSQL, MySQL, T-SQL, and Fabric,
+  while strict mode rejects lossy conversions.
+- T-SQL, Fabric, MySQL, and SQLite now accept single-quoted select-list aliases
+  with or without `AS` and emit the target dialect's identifier quoting. The
+  syntax remains gated to dialects that support it.
+- PostgreSQL parsing and generation now support `SET [LOCAL | SESSION] SESSION
+  AUTHORIZATION`, `RESET SESSION AUTHORIZATION`, and role-membership
+  `GRANT`/`REVOKE` statements without an `ON` clause. Statement boundaries and
+  structured object-privilege grants are preserved.
+
+### Fixed
+- PostgreSQL row-value equality against scalar subqueries now lowers to
+  T-SQL/Fabric scalar `CASE` subqueries with correct true, false, and null
+  behavior. Zero- and multi-row cardinality, query modifiers, explicit aliases,
+  projection counts, and generated-alias collisions are handled correctly.
+- CTE star expansion and lineage analysis now process every branch of nested
+  `UNION`, `INTERSECT`, and `EXCEPT` expressions instead of only the leftmost
+  branch, while retaining conservative behavior for recursive or unresolved
+  references.
+- PostgreSQL hexadecimal `bytea` literals now lower to T-SQL/Fabric binary
+  literals, including empty values, embedded whitespace, and values passed to
+  `SET_BIT`. Strict mode rejects malformed, odd-length, or unsupported escape-
+  format literals instead of emitting incorrect SQL.
+- PostgreSQL `TO_NUMBER` formats containing grouping separators or positional
+  spaces are no longer translated to unsafe T-SQL/Fabric `TRY_CONVERT` calls.
+  Default mode preserves the source function and strict mode rejects the lossy
+  conversion, while simple supported formats still use `TRY_CONVERT`.
+- T-SQL and Fabric generation now emits `LEN` rather than `LENGTH` for parsed
+  length expressions, including Rust and WASM/TypeScript round trips.
+- `SEED` and `REPEATABLE` can now be used as implicit table aliases in T-SQL
+  and Fabric without breaking their existing `TABLESAMPLE` clause handling.
+- PostgreSQL `date_part` second, millisecond, and microsecond fields over
+  timestamp values now compose the complete seconds value when targeting
+  T-SQL/Fabric, including fractional portions and timestamp-with-time-zone
+  inputs.
+- Parenthesized joined-table groups followed by `OUTER APPLY` now reparse
+  correctly in T-SQL and Fabric, making generated join groups round-trip safe.
+- PostgreSQL quantified comparisons against literal arrays now lower across
+  the full operator set for T-SQL/Fabric: equality and inequality use
+  `IN`/`NOT IN`, other `ANY`/`ALL` operators use boolean chains, and empty
+  arrays produce the correct constant result. Typed values and null semantics
+  are preserved, while dynamic arrays remain rejected.
+
 ## [0.6.2] - 2026-07-17
 
 ### Added

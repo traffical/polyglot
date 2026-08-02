@@ -1431,9 +1431,9 @@ pub(super) fn normalize(
                     )
                 }
                 Expression::Extract(_)
-                    if matches!(source, DialectType::PostgreSQL)
-                        && matches!(target, DialectType::TSQL | DialectType::Fabric)
-                        && temporal::is_postgres_time_date_part(&e) =>
+                        if matches!(source, DialectType::PostgreSQL)
+                            && matches!(target, DialectType::TSQL | DialectType::Fabric)
+                        && temporal::is_postgres_date_part_for_tsql(&e) =>
                 {
                     Action::Temporal(temporal::Action::PostgresDatePartForTsql)
                 }

@@ -2007,11 +2007,23 @@ mod tsql_fabric_regressions {
     }
 
     #[test]
-    fn postgres_time_date_parts_preserve_values_and_result_types_for_tsql_targets() {
+    fn postgres_subsecond_date_parts_preserve_values_and_result_types_for_tsql_targets() {
         for target in [DialectType::TSQL, DialectType::Fabric] {
             let time = match target {
                 DialectType::Fabric => "CAST('13:30:25.575401' AS TIME(6))",
                 _ => "CAST('13:30:25.575401' AS TIME)",
+            };
+            let timestamp = match target {
+                DialectType::Fabric => "CAST('2001-02-16 20:38:40.575401' AS DATETIME2(6))",
+                _ => "CAST('2001-02-16 20:38:40.575401' AS DATETIME2)",
+            };
+            let timestamp_column = match target {
+                DialectType::Fabric => "CAST(ts AS DATETIME2(6))",
+                _ => "CAST(ts AS DATETIME2)",
+            };
+            let timestamp_with_time_zone = match target {
+                DialectType::Fabric => "CAST('2001-02-16 20:38:40.575401+00' AS DATETIME2(6))",
+                _ => "CAST('2001-02-16 20:38:40.575401+00' AS DATETIME2)",
             };
             let cases = [
                 (
@@ -2057,8 +2069,34 @@ mod tsql_fabric_regressions {
                     ),
                 ),
                 (
-                    "SELECT EXTRACT(second FROM ts) AS value FROM t",
-                    "SELECT DATEPART(SECOND, ts) AS value FROM t".to_string(),
+                    "SELECT date_part('second', ts) AS value FROM t",
+                    "SELECT CAST(DATEPART(SECOND, ts) + DATEPART(MICROSECOND, ts) / 1000000.0 AS FLOAT) AS value FROM t".to_string(),
+                ),
+                (
+                    "SELECT date_part('milliseconds', ts) AS value FROM t",
+                    "SELECT CAST(DATEPART(SECOND, ts) * 1000 + DATEPART(MICROSECOND, ts) / 1000.0 AS FLOAT) AS value FROM t".to_string(),
+                ),
+                (
+                    "SELECT date_part('microseconds', ts) AS value FROM t",
+                    "SELECT CAST(DATEPART(SECOND, ts) * 1000000 + DATEPART(MICROSECOND, ts) AS FLOAT) AS value FROM t".to_string(),
+                ),
+                (
+                    "SELECT date_part('second', TIMESTAMP '2001-02-16 20:38:40.575401') AS value",
+                    format!(
+                        "SELECT CAST(DATEPART(SECOND, {timestamp}) + DATEPART(MICROSECOND, {timestamp}) / 1000000.0 AS FLOAT) AS value"
+                    ),
+                ),
+                (
+                    "SELECT EXTRACT(milliseconds FROM ts::timestamp) AS value FROM t",
+                    format!(
+                        "SELECT DATEPART(SECOND, {timestamp_column}) * 1000 + DATEPART(MICROSECOND, {timestamp_column}) / 1000.0 AS value FROM t"
+                    ),
+                ),
+                (
+                    "SELECT date_part('microseconds', TIMESTAMPTZ '2001-02-16 20:38:40.575401+00') AS value",
+                    format!(
+                        "SELECT CAST(DATEPART(SECOND, {timestamp_with_time_zone}) * 1000000 + DATEPART(MICROSECOND, {timestamp_with_time_zone}) AS FLOAT) AS value"
+                    ),
                 ),
                 (
                     "SELECT EXTRACT(hour FROM '13:30:25.575401'::time) AS value",

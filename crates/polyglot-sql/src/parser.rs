@@ -1670,9 +1670,16 @@ impl Parser {
             }
             // DuckDB: RESET [SESSION|GLOBAL|LOCAL] variable
             TokenType::Var if self.peek_text().eq_ignore_ascii_case("RESET") => {
-                self.skip(); // consume RESET
-                self.parse_as_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse RESET statement"))
+                // PostgreSQL: RESET SESSION AUTHORIZATION. Preserve this statement
+                // verbatim, but stop at its semicolon so subsequent statements in
+                // the same input are parsed independently.
+                if self.check_text_seq(&["RESET", "SESSION", "AUTHORIZATION"]) {
+                    self.fallback_to_command(statement_start)
+                } else {
+                    self.skip(); // consume RESET
+                    self.parse_as_command()?
+                        .ok_or_else(|| self.parse_error("Failed to parse RESET statement"))
+                }
             }
             // DuckDB statement-level PIVOT/UNPIVOT/PIVOT_WIDER syntax
             TokenType::Pivot => {
@@ -3742,8 +3749,9 @@ impl Parser {
                         }))
                     } else {
                         // Allow keywords as aliases (e.g., SELECT 1 AS filter)
-                        // Use _with_quoted to preserve quoted alias
-                        let alias = self.expect_identifier_or_keyword_with_quoted()?;
+                        // Use the projection-specific parser so dialects that support
+                        // string aliases can treat the string as a quoted identifier.
+                        let alias = self.parse_projection_alias_identifier()?;
                         let mut trailing_comments = self.previous_trailing_comments().to_vec();
                         // If parse_comparison stored pending leading comments (no comparison
                         // followed), use those. Otherwise use the leading_comments we captured
@@ -3765,7 +3773,7 @@ impl Parser {
                             inferred_type: None,
                         }))
                     }
-                } else if ((self.check(TokenType::Var) && !self.check_keyword()) || self.check(TokenType::QuotedIdentifier) || self.can_be_alias_keyword() || self.is_command_keyword_as_alias() || self.check(TokenType::Overlaps)
+                } else if ((self.check(TokenType::Var) && !self.check_keyword()) || self.check(TokenType::QuotedIdentifier) || (self.check(TokenType::String) && self.supports_string_aliases()) || self.can_be_alias_keyword() || self.is_command_keyword_as_alias() || self.check(TokenType::Overlaps)
                     // ClickHouse: APPLY without ( is an implicit alias (e.g., SELECT col apply)
                     || (self.check(TokenType::Apply) && !self.check_next(TokenType::LParen)
                         && matches!(self.config.dialect, Some(crate::dialects::DialectType::ClickHouse))))
@@ -3799,20 +3807,14 @@ impl Parser {
                     && !(self.check_identifier("PARALLEL") && self.check_next(TokenType::With)
                         && matches!(self.config.dialect, Some(crate::dialects::DialectType::ClickHouse)))
                 {
-                    // Implicit alias (without AS) - allow Var tokens, QuotedIdentifiers, command keywords (like GET, PUT, etc.), and OVERLAPS
+                    // Implicit alias (without AS) - allow Var tokens, quoted identifiers,
+                    // dialect-gated string aliases, command keywords, and OVERLAPS.
                     // But NOT when it's the Oracle BULK COLLECT INTO sequence
-                    let alias_token = self.advance();
-                    let alias_text = alias_token.text.to_string();
-                    let is_quoted = alias_token.token_type == TokenType::QuotedIdentifier;
+                    let alias = self.parse_projection_alias_identifier()?;
                     let trailing_comments = self.previous_trailing_comments().to_vec();
                     Expression::Alias(Box::new(Alias {
                         this: expr,
-                        alias: Identifier {
-                            name: alias_text,
-                            quoted: is_quoted,
-                            trailing_comments: Vec::new(),
-                            span: None,
-                        },
+                        alias,
                         column_aliases: Vec::new(),
                         alias_explicit_as: false,
                         alias_keyword: None,
@@ -4636,6 +4638,7 @@ impl Parser {
                     let set_result = self.parse_set_operation(inner)?;
                     set_result
                 } else if self.check(TokenType::Cross)
+                    || self.check(TokenType::Outer)
                     || self.check(TokenType::Inner)
                     || self.check(TokenType::Left)
                     || self.check(TokenType::Right)
@@ -9905,12 +9908,12 @@ impl Parser {
                 (final_method, seed, false, true)
             } else {
                 // Parse optional SEED / REPEATABLE
-                let (seed, use_seed_keyword) = if self.match_token(TokenType::Seed) {
+                let (seed, use_seed_keyword) = if self.match_texts(&["SEED"]) {
                     self.expect(TokenType::LParen)?;
                     let seed_value = self.parse_expression()?;
                     self.expect(TokenType::RParen)?;
                     (Some(seed_value), true)
-                } else if self.match_token(TokenType::Repeatable) {
+                } else if self.match_texts(&["REPEATABLE"]) {
                     self.expect(TokenType::LParen)?;
                     let seed_value = self.parse_expression()?;
                     self.expect(TokenType::RParen)?;
@@ -10131,12 +10134,12 @@ impl Parser {
         self.expect(TokenType::RParen)?;
 
         // Optional SEED/REPEATABLE
-        let (seed, use_seed_keyword) = if self.match_token(TokenType::Seed) {
+        let (seed, use_seed_keyword) = if self.match_texts(&["SEED"]) {
             self.expect(TokenType::LParen)?;
             let seed_value = self.parse_expression()?;
             self.expect(TokenType::RParen)?;
             (Some(seed_value), true)
-        } else if self.match_token(TokenType::Repeatable) {
+        } else if self.match_texts(&["REPEATABLE"]) {
             self.expect(TokenType::LParen)?;
             let seed_value = self.parse_expression()?;
             self.expect(TokenType::RParen)?;
@@ -25030,59 +25033,59 @@ impl Parser {
     /// Parse GRANT statement
     /// GRANT <privileges> ON [<kind>] <object> TO <principals> [WITH GRANT OPTION]
     fn parse_grant(&mut self) -> Result<Expression> {
+        let statement_start = self.current;
         self.expect(TokenType::Grant)?;
 
-        // ClickHouse: GRANT can grant roles (no ON clause), grant privileges (has ON clause),
-        // or use complex syntax. If we see TO before ON, treat as command.
-        // Also: multi-privilege grants (multiple ON), wildcard grants (test*.*),
-        // WITH REPLACE OPTION all parse as commands.
-        if matches!(
+        // Role membership grants use GRANT role TO principal without an ON
+        // clause. Preserve those as commands because the structured Grant AST
+        // represents object privileges and requires a securable object.
+        // ClickHouse also needs command fallback for several complex grant forms.
+        let is_clickhouse = matches!(
             self.config.dialect,
             Some(crate::dialects::DialectType::ClickHouse)
-        ) {
-            // Save position after GRANT keyword
-            let saved_pos = self.current;
-            // Scan ahead to check grant structure
-            let mut depth = 0i32;
-            let mut on_count = 0;
-            let mut found_to = false;
-            let mut has_star_in_name = false;
-            let mut has_replace_option = false;
-            let mut i = self.current;
-            while i < self.tokens.len() && self.tokens[i].token_type != TokenType::Semicolon {
-                match self.tokens[i].token_type {
-                    TokenType::LParen => depth += 1,
-                    TokenType::RParen => depth -= 1,
-                    TokenType::On if depth == 0 => on_count += 1,
-                    TokenType::To if depth == 0 => {
-                        found_to = true;
-                    }
-                    TokenType::Star if depth == 0 && on_count > 0 && !found_to => {
-                        // Check if star is part of a wildcard name (e.g., test*.*)
-                        if i > 0
-                            && self.tokens[i - 1].token_type != TokenType::Dot
-                            && self.tokens[i - 1].token_type != TokenType::On
-                        {
-                            has_star_in_name = true;
-                        }
-                    }
-                    TokenType::Replace if depth == 0 && found_to => {
-                        has_replace_option = true;
-                    }
-                    _ => {}
+        );
+        let saved_pos = self.current;
+        let mut depth = 0i32;
+        let mut on_count = 0;
+        let mut found_to = false;
+        let mut has_star_in_name = false;
+        let mut has_replace_option = false;
+        let mut i = self.current;
+        while i < self.tokens.len() && self.tokens[i].token_type != TokenType::Semicolon {
+            match self.tokens[i].token_type {
+                TokenType::LParen => depth += 1,
+                TokenType::RParen => depth -= 1,
+                TokenType::On if depth == 0 => on_count += 1,
+                TokenType::To if depth == 0 => {
+                    found_to = true;
                 }
-                i += 1;
+                TokenType::Star if depth == 0 && on_count > 0 && !found_to => {
+                    // Check if star is part of a wildcard name (e.g., test*.*)
+                    if i > 0
+                        && self.tokens[i - 1].token_type != TokenType::Dot
+                        && self.tokens[i - 1].token_type != TokenType::On
+                    {
+                        has_star_in_name = true;
+                    }
+                }
+                TokenType::Replace if depth == 0 && found_to => {
+                    has_replace_option = true;
+                }
+                _ => {}
             }
-            if (found_to && on_count == 0) || on_count > 1 || has_star_in_name || has_replace_option
-            {
-                // Role grant, multi-privilege grant, wildcard grant, or REPLACE OPTION — parse as command
-                self.current = saved_pos;
-                return self
-                    .parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse GRANT statement"));
-            }
-            self.current = saved_pos;
+            i += 1;
         }
+        if found_to && on_count == 0 {
+            self.current = saved_pos;
+            return self.fallback_to_command(statement_start);
+        }
+        if is_clickhouse && (on_count > 1 || has_star_in_name || has_replace_option) {
+            self.current = saved_pos;
+            return self
+                .parse_command()?
+                .ok_or_else(|| self.parse_error("Failed to parse GRANT statement"));
+        }
+        self.current = saved_pos;
 
         // Parse privileges (e.g., SELECT, INSERT, UPDATE)
         let privileges = self.parse_privileges()?;
@@ -25143,47 +25146,53 @@ impl Parser {
     /// Parse REVOKE statement
     /// REVOKE [GRANT OPTION FOR] <privileges> ON [<kind>] <object> FROM <principals> [CASCADE]
     fn parse_revoke(&mut self) -> Result<Expression> {
+        let statement_start = self.current;
         self.expect(TokenType::Revoke)?;
 
-        // ClickHouse: REVOKE role FROM user (no ON clause), multi-privilege, or wildcard — parse as command
-        if matches!(
+        // Role membership revocations use REVOKE role FROM principal without
+        // an ON clause. Preserve those as commands for the same reason as role
+        // membership grants. Keep ClickHouse's additional command fallbacks.
+        let is_clickhouse = matches!(
             self.config.dialect,
             Some(crate::dialects::DialectType::ClickHouse)
-        ) {
-            let saved_pos = self.current;
-            let mut depth = 0i32;
-            let mut on_count = 0;
-            let mut found_from = false;
-            let mut has_star_in_name = false;
-            let mut i = self.current;
-            while i < self.tokens.len() && self.tokens[i].token_type != TokenType::Semicolon {
-                match self.tokens[i].token_type {
-                    TokenType::LParen => depth += 1,
-                    TokenType::RParen => depth -= 1,
-                    TokenType::On if depth == 0 => on_count += 1,
-                    TokenType::From if depth == 0 => {
-                        found_from = true;
-                    }
-                    TokenType::Star if depth == 0 && on_count > 0 && !found_from => {
-                        if i > 0
-                            && self.tokens[i - 1].token_type != TokenType::Dot
-                            && self.tokens[i - 1].token_type != TokenType::On
-                        {
-                            has_star_in_name = true;
-                        }
-                    }
-                    _ => {}
+        );
+        let saved_pos = self.current;
+        let mut depth = 0i32;
+        let mut on_count = 0;
+        let mut found_from = false;
+        let mut has_star_in_name = false;
+        let mut i = self.current;
+        while i < self.tokens.len() && self.tokens[i].token_type != TokenType::Semicolon {
+            match self.tokens[i].token_type {
+                TokenType::LParen => depth += 1,
+                TokenType::RParen => depth -= 1,
+                TokenType::On if depth == 0 => on_count += 1,
+                TokenType::From if depth == 0 => {
+                    found_from = true;
                 }
-                i += 1;
+                TokenType::Star if depth == 0 && on_count > 0 && !found_from => {
+                    if i > 0
+                        && self.tokens[i - 1].token_type != TokenType::Dot
+                        && self.tokens[i - 1].token_type != TokenType::On
+                    {
+                        has_star_in_name = true;
+                    }
+                }
+                _ => {}
             }
-            if (found_from && on_count == 0) || on_count > 1 || has_star_in_name {
-                self.current = saved_pos;
-                return self
-                    .parse_command()?
-                    .ok_or_else(|| self.parse_error("Failed to parse REVOKE statement"));
-            }
-            self.current = saved_pos;
+            i += 1;
         }
+        if found_from && on_count == 0 {
+            self.current = saved_pos;
+            return self.fallback_to_command(statement_start);
+        }
+        if is_clickhouse && (on_count > 1 || has_star_in_name) {
+            self.current = saved_pos;
+            return self
+                .parse_command()?
+                .ok_or_else(|| self.parse_error("Failed to parse REVOKE statement"));
+        }
+        self.current = saved_pos;
 
         // Check for GRANT OPTION FOR
         let grant_option = if self.check(TokenType::Grant) {
@@ -25532,6 +25541,41 @@ impl Parser {
         self.expect(TokenType::Set)?;
 
         let mut items = Vec::new();
+
+        // PostgreSQL: SET [SESSION | LOCAL] SESSION AUTHORIZATION
+        // user_name | DEFAULT. Check this before the generic SET modifier logic,
+        // which would otherwise interpret SESSION/LOCAL as the parameter scope
+        // and AUTHORIZATION as an ordinary configuration variable.
+        let session_authorization_kind =
+            if self.match_text_seq(&["LOCAL", "SESSION", "AUTHORIZATION"]) {
+                Some(Some("LOCAL".to_string()))
+            } else if self.match_text_seq(&["SESSION", "SESSION", "AUTHORIZATION"]) {
+                Some(Some("SESSION".to_string()))
+            } else if self.match_text_seq(&["SESSION", "AUTHORIZATION"]) {
+                Some(None)
+            } else {
+                None
+            };
+
+        if let Some(kind) = session_authorization_kind {
+            let value = if self.match_token(TokenType::Default) {
+                Expression::Identifier(Identifier::new("DEFAULT"))
+            } else if self.is_at_end() || self.check(TokenType::Semicolon) {
+                return Err(self
+                    .parse_error("Expected user name or DEFAULT after SET SESSION AUTHORIZATION"));
+            } else {
+                self.parse_primary()?
+            };
+
+            items.push(SetItem {
+                name: Expression::Identifier(Identifier::new("SESSION AUTHORIZATION")),
+                value,
+                kind,
+                no_equals: true,
+            });
+
+            return Ok(Expression::SetStatement(Box::new(SetStatement { items })));
+        }
 
         // T-SQL: SET STATISTICS TIME|IO|XML|PROFILE ON|OFF. The existing SET
         // parser handles simple options like SET NOCOUNT ON, but these
@@ -41177,6 +41221,216 @@ impl Parser {
         })))
     }
 
+    fn parse_oracle_precision(&mut self, context: &str, minimum: u32, maximum: u32) -> Result<u32> {
+        let value = self.expect_number()?;
+        let value = u32::try_from(value)
+            .map_err(|_| self.parse_error(format!("{context} must be non-negative")))?;
+        if !(minimum..=maximum).contains(&value) {
+            return Err(
+                self.parse_error(format!("{context} must be between {minimum} and {maximum}"))
+            );
+        }
+        Ok(value)
+    }
+
+    fn parse_oracle_character_type(&mut self, kind: OracleCharacterKind) -> Result<DataType> {
+        let supports_length_semantics = matches!(
+            kind,
+            OracleCharacterKind::Char | OracleCharacterKind::VarChar
+        );
+        let (length, semantics) = if self.match_token(TokenType::LParen) {
+            let length = self.parse_oracle_precision("Oracle character length", 1, u32::MAX)?;
+            let semantics = if supports_length_semantics && self.match_keyword("BYTE") {
+                Some(OracleCharacterLengthSemantics::Byte)
+            } else if supports_length_semantics && self.match_keyword("CHAR") {
+                Some(OracleCharacterLengthSemantics::Char)
+            } else {
+                None
+            };
+            self.expect(TokenType::RParen)?;
+            (Some(length), semantics)
+        } else {
+            (None, None)
+        };
+
+        Ok(DataType::Oracle {
+            oracle_type: OracleDataType::Character {
+                kind,
+                length,
+                semantics,
+            },
+        })
+    }
+
+    /// Parse an Oracle-specific data type after its first token has been consumed.
+    ///
+    /// Returns `None` for names that should continue through the generic data type parser.
+    fn parse_oracle_data_type(&mut self, name: &str) -> Result<Option<DataType>> {
+        if !matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::Oracle)
+        ) {
+            return Ok(None);
+        }
+
+        let oracle_type = match name {
+            "NUMBER" => {
+                let (precision, scale) = if self.match_token(TokenType::LParen) {
+                    let precision = if self.match_token(TokenType::Star) {
+                        None
+                    } else {
+                        Some(self.parse_oracle_precision("Oracle NUMBER precision", 1, 38)?)
+                    };
+                    let scale = if self.match_token(TokenType::Comma) {
+                        let scale = self.expect_number()?;
+                        let scale = i32::try_from(scale)
+                            .map_err(|_| self.parse_error("Oracle NUMBER scale is out of range"))?;
+                        if !(-84..=127).contains(&scale) {
+                            return Err(
+                                self.parse_error("Oracle NUMBER scale must be between -84 and 127")
+                            );
+                        }
+                        Some(scale)
+                    } else {
+                        None
+                    };
+                    self.expect(TokenType::RParen)?;
+                    (precision, scale)
+                } else {
+                    (None, None)
+                };
+                OracleDataType::Number { precision, scale }
+            }
+            "BINARY_FLOAT" => OracleDataType::BinaryFloat,
+            "BINARY_DOUBLE" => OracleDataType::BinaryDouble,
+            "FLOAT" => {
+                let precision = if self.match_token(TokenType::LParen) {
+                    let precision =
+                        self.parse_oracle_precision("Oracle FLOAT precision", 1, 126)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(precision)
+                } else {
+                    None
+                };
+                OracleDataType::Float { precision }
+            }
+            "CHAR" => {
+                return self
+                    .parse_oracle_character_type(OracleCharacterKind::Char)
+                    .map(Some);
+            }
+            "VARCHAR2" => {
+                return self
+                    .parse_oracle_character_type(OracleCharacterKind::VarChar)
+                    .map(Some);
+            }
+            "NCHAR" => {
+                return self
+                    .parse_oracle_character_type(OracleCharacterKind::NChar)
+                    .map(Some);
+            }
+            "NVARCHAR2" => {
+                return self
+                    .parse_oracle_character_type(OracleCharacterKind::NVarChar)
+                    .map(Some);
+            }
+            "DATE" => OracleDataType::Date,
+            "TIMESTAMP" => {
+                let precision = if self.match_token(TokenType::LParen) {
+                    let precision =
+                        self.parse_oracle_precision("Oracle TIMESTAMP precision", 0, 9)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(precision)
+                } else {
+                    None
+                };
+                let timezone = if self.match_token(TokenType::With) {
+                    if self.match_token(TokenType::Local) {
+                        if !self.match_keyword("TIME") || !self.match_keyword("ZONE") {
+                            return Err(self.parse_error("Expected LOCAL TIME ZONE"));
+                        }
+                        OracleTimestampTimeZone::WithLocalTimeZone
+                    } else {
+                        if !self.match_keyword("TIME") || !self.match_keyword("ZONE") {
+                            return Err(self.parse_error("Expected TIME ZONE"));
+                        }
+                        OracleTimestampTimeZone::WithTimeZone
+                    }
+                } else if self.match_keyword("WITHOUT") {
+                    if !self.match_keyword("TIME") || !self.match_keyword("ZONE") {
+                        return Err(self.parse_error("Expected TIME ZONE"));
+                    }
+                    OracleTimestampTimeZone::None
+                } else {
+                    OracleTimestampTimeZone::None
+                };
+                OracleDataType::Timestamp {
+                    precision,
+                    timezone,
+                }
+            }
+            "INTERVAL" if self.match_keyword("YEAR") => {
+                let year_precision = if self.match_token(TokenType::LParen) {
+                    let precision =
+                        self.parse_oracle_precision("Oracle INTERVAL YEAR precision", 0, 9)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(precision)
+                } else {
+                    None
+                };
+                if !self.match_token(TokenType::To) || !self.match_keyword("MONTH") {
+                    return Err(self.parse_error("Expected TO MONTH"));
+                }
+                OracleDataType::IntervalYearToMonth { year_precision }
+            }
+            "INTERVAL" if self.match_keyword("DAY") => {
+                let day_precision = if self.match_token(TokenType::LParen) {
+                    let precision =
+                        self.parse_oracle_precision("Oracle INTERVAL DAY precision", 0, 9)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(precision)
+                } else {
+                    None
+                };
+                if !self.match_token(TokenType::To) || !self.match_keyword("SECOND") {
+                    return Err(self.parse_error("Expected TO SECOND"));
+                }
+                let fractional_seconds_precision = if self.match_token(TokenType::LParen) {
+                    let precision =
+                        self.parse_oracle_precision("Oracle INTERVAL SECOND precision", 0, 9)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(precision)
+                } else {
+                    None
+                };
+                OracleDataType::IntervalDayToSecond {
+                    day_precision,
+                    fractional_seconds_precision,
+                }
+            }
+            "CLOB" => OracleDataType::Clob { national: false },
+            "NCLOB" => OracleDataType::Clob { national: true },
+            "BLOB" => OracleDataType::Blob,
+            "RAW" => {
+                let length = if self.match_token(TokenType::LParen) {
+                    let length = self.parse_oracle_precision("Oracle RAW length", 1, u32::MAX)?;
+                    self.expect(TokenType::RParen)?;
+                    Some(length)
+                } else {
+                    None
+                };
+                OracleDataType::Raw { length }
+            }
+            "LONG" => OracleDataType::Long {
+                raw: self.match_keyword("RAW"),
+            },
+            "ROWID" => OracleDataType::RowId,
+            _ => return Ok(None),
+        };
+
+        Ok(Some(DataType::Oracle { oracle_type }))
+    }
+
     /// Parse a data type
     fn parse_data_type(&mut self) -> Result<DataType> {
         // Handle special token types that represent data type keywords
@@ -41227,6 +41481,10 @@ impl Parser {
                     });
                 }
             }
+        }
+
+        if let Some(data_type) = self.parse_oracle_data_type(&name)? {
+            return Ok(data_type);
         }
 
         let base_type = match name.as_str() {
@@ -42357,6 +42615,10 @@ impl Parser {
         }
         let name = raw_name.to_ascii_uppercase();
 
+        if let Some(data_type) = self.parse_oracle_data_type(&name)? {
+            return self.maybe_parse_collated_data_type(data_type);
+        }
+
         // Handle parametric types like ARRAY<T>, MAP<K,V>
         let base_type = match name.as_str() {
             "ARRAY" => {
@@ -43181,6 +43443,105 @@ impl Parser {
         }
     }
 
+    fn oracle_data_type_to_string(&self, data_type: &OracleDataType) -> String {
+        match data_type {
+            OracleDataType::Number { precision, scale } => {
+                if precision.is_none() && scale.is_none() {
+                    "NUMBER".to_string()
+                } else {
+                    let precision = precision
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "*".to_string());
+                    if let Some(scale) = scale {
+                        format!("NUMBER({precision}, {scale})")
+                    } else {
+                        format!("NUMBER({precision})")
+                    }
+                }
+            }
+            OracleDataType::BinaryFloat => "BINARY_FLOAT".to_string(),
+            OracleDataType::BinaryDouble => "BINARY_DOUBLE".to_string(),
+            OracleDataType::Float { precision } => precision
+                .map(|value| format!("FLOAT({value})"))
+                .unwrap_or_else(|| "FLOAT".to_string()),
+            OracleDataType::Character {
+                kind,
+                length,
+                semantics,
+            } => {
+                let name = match kind {
+                    OracleCharacterKind::Char => "CHAR",
+                    OracleCharacterKind::VarChar => "VARCHAR2",
+                    OracleCharacterKind::NChar => "NCHAR",
+                    OracleCharacterKind::NVarChar => "NVARCHAR2",
+                };
+                if let Some(length) = length {
+                    let semantics = match semantics {
+                        Some(OracleCharacterLengthSemantics::Byte) => " BYTE",
+                        Some(OracleCharacterLengthSemantics::Char) => " CHAR",
+                        None => "",
+                    };
+                    format!("{name}({length}{semantics})")
+                } else {
+                    name.to_string()
+                }
+            }
+            OracleDataType::Date => "DATE".to_string(),
+            OracleDataType::Timestamp {
+                precision,
+                timezone,
+            } => {
+                let mut sql = "TIMESTAMP".to_string();
+                if let Some(precision) = precision {
+                    sql.push_str(&format!("({precision})"));
+                }
+                sql.push_str(match timezone {
+                    OracleTimestampTimeZone::None => "",
+                    OracleTimestampTimeZone::WithTimeZone => " WITH TIME ZONE",
+                    OracleTimestampTimeZone::WithLocalTimeZone => " WITH LOCAL TIME ZONE",
+                });
+                sql
+            }
+            OracleDataType::IntervalYearToMonth { year_precision } => {
+                let precision = year_precision
+                    .map(|value| format!("({value})"))
+                    .unwrap_or_default();
+                format!("INTERVAL YEAR{precision} TO MONTH")
+            }
+            OracleDataType::IntervalDayToSecond {
+                day_precision,
+                fractional_seconds_precision,
+            } => {
+                let day_precision = day_precision
+                    .map(|value| format!("({value})"))
+                    .unwrap_or_default();
+                let fractional_seconds_precision = fractional_seconds_precision
+                    .map(|value| format!("({value})"))
+                    .unwrap_or_default();
+                format!("INTERVAL DAY{day_precision} TO SECOND{fractional_seconds_precision}")
+            }
+            OracleDataType::Clob { national } => {
+                if *national {
+                    "NCLOB".to_string()
+                } else {
+                    "CLOB".to_string()
+                }
+            }
+            OracleDataType::Blob => "BLOB".to_string(),
+            OracleDataType::Raw { length } => length
+                .map(|value| format!("RAW({value})"))
+                .unwrap_or_else(|| "RAW".to_string()),
+            OracleDataType::Long { raw } => {
+                if *raw {
+                    "LONG RAW".to_string()
+                } else {
+                    "LONG".to_string()
+                }
+            }
+            OracleDataType::RowId => "ROWID".to_string(),
+        }
+    }
+
     /// Convert a DataType to a string representation for JSONColumnDef.kind
     fn data_type_to_string(&self, dt: &DataType) -> String {
         match dt {
@@ -43237,6 +43598,7 @@ impl Parser {
             DataType::Decimal {
                 precision: None, ..
             } => "DECIMAL".to_string(),
+            DataType::Oracle { oracle_type } => self.oracle_data_type_to_string(oracle_type),
             DataType::VarChar {
                 length: Some(n), ..
             } => format!("VARCHAR({})", n),
@@ -44921,6 +45283,28 @@ impl Parser {
             parts.push(self.expect_identifier_with_quoted()?);
         }
         Ok(parts)
+    }
+
+    /// Whether the active dialect supports string literals as projection aliases.
+    fn supports_string_aliases(&self) -> bool {
+        self.config
+            .dialect
+            .is_some_and(crate::dialects::DialectType::supports_string_aliases)
+    }
+
+    /// Parse a SELECT projection alias without widening identifier parsing elsewhere.
+    fn parse_projection_alias_identifier(&mut self) -> Result<Identifier> {
+        if self.check(TokenType::String) && self.supports_string_aliases() {
+            let token = self.advance();
+            Ok(Identifier {
+                name: token.text,
+                quoted: true,
+                trailing_comments: Vec::new(),
+                span: None,
+            })
+        } else {
+            self.expect_identifier_or_keyword_with_quoted()
+        }
     }
 
     /// Expect an identifier or keyword (for column names, field names, etc.)
@@ -49618,6 +50002,7 @@ impl Parser {
                 (Some(p), None) => format!("DECIMAL({})", p),
                 _ => "DECIMAL".to_string(),
             },
+            DataType::Oracle { oracle_type } => self.oracle_data_type_to_string(oracle_type),
             DataType::Char { length } => {
                 if let Some(n) = length {
                     format!("CHAR({})", n)
@@ -64280,5 +64665,158 @@ mod clickhouse_parser_regression_tests {
             }
             Err(e) => panic!("Failed to parse DuckDB INTERVAL 3 DAY: {}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod postgres_session_authorization_regression_tests {
+    use crate::{DialectType, Expression};
+
+    #[test]
+    fn test_postgres_set_session_authorization() {
+        let cases = [
+            "SET SESSION AUTHORIZATION abluva",
+            "SET SESSION AUTHORIZATION 'abluva'",
+            "SET SESSION AUTHORIZATION DEFAULT",
+            "SET LOCAL SESSION AUTHORIZATION abluva",
+            "SET LOCAL SESSION AUTHORIZATION 'abluva'",
+            "SET LOCAL SESSION AUTHORIZATION DEFAULT",
+            "SET SESSION SESSION AUTHORIZATION abluva",
+            "SET SESSION SESSION AUTHORIZATION 'abluva'",
+            "SET SESSION SESSION AUTHORIZATION DEFAULT",
+        ];
+
+        for sql in cases {
+            let parsed = crate::parse_one(sql, DialectType::PostgreSQL).unwrap();
+            let set = match &parsed {
+                Expression::SetStatement(set) => set,
+                other => panic!("Expected SetStatement for {sql}, got {other:?}"),
+            };
+            assert_eq!(set.items.len(), 1, "unexpected SET items for {sql}");
+            assert!(set.items[0].no_equals, "unexpected equals form for {sql}");
+
+            let output =
+                crate::transpile(sql, DialectType::PostgreSQL, DialectType::PostgreSQL).unwrap();
+            assert_eq!(output, vec![sql]);
+        }
+    }
+
+    #[test]
+    fn test_postgres_session_authorization_statement_boundaries() {
+        let sql = "BEGIN; SET LOCAL SESSION AUTHORIZATION abluva; SELECT current_user::text || '|' || session_user::text AS identity; RESET SESSION AUTHORIZATION; COMMIT;";
+        let dialect = crate::dialects::Dialect::get(DialectType::PostgreSQL);
+        let parsed = dialect.parse(sql).unwrap();
+
+        assert_eq!(parsed.len(), 5);
+        assert!(matches!(&parsed[0], Expression::Transaction(_)));
+        assert!(matches!(&parsed[1], Expression::SetStatement(_)));
+        assert!(matches!(&parsed[2], Expression::Select(_)));
+        assert!(matches!(&parsed[3], Expression::Command(_)));
+        assert!(matches!(&parsed[4], Expression::Commit(_)));
+
+        let output = dialect.transpile(sql, DialectType::PostgreSQL).unwrap();
+        assert_eq!(output.len(), 5);
+        assert_eq!(output[1], "SET LOCAL SESSION AUTHORIZATION abluva");
+        assert_eq!(output[3], "RESET SESSION AUTHORIZATION");
+    }
+
+    #[test]
+    fn test_postgres_reset_session_authorization() {
+        let parsed =
+            crate::parse_one("RESET SESSION AUTHORIZATION", DialectType::PostgreSQL).unwrap();
+        assert!(matches!(parsed, Expression::Command(_)));
+
+        let output = crate::transpile(
+            "RESET SESSION AUTHORIZATION",
+            DialectType::PostgreSQL,
+            DialectType::PostgreSQL,
+        )
+        .unwrap();
+        assert_eq!(output, vec!["RESET SESSION AUTHORIZATION"]);
+    }
+}
+
+#[cfg(test)]
+mod grant_revoke_role_membership_regression_tests {
+    use crate::{DialectType, Expression};
+
+    fn assert_command_identity(sql: &str, dialect: DialectType) {
+        let parsed = crate::parse_one(sql, dialect).unwrap();
+        assert!(
+            matches!(parsed, Expression::Command(_)),
+            "expected Command for {dialect:?}: {sql}"
+        );
+
+        let output = crate::transpile(sql, dialect, dialect).unwrap();
+        assert_eq!(output, vec![sql.trim_end_matches(';')]);
+    }
+
+    #[test]
+    fn test_issue_379_postgres_role_grants_without_on() {
+        for sql in [
+            "GRANT abluva TO \"kk8529p@abluva.com\";",
+            "GRANT developer_role TO john;",
+            "GRANT admin_role TO mary WITH ADMIN OPTION;",
+            "GRANT role1, role2 TO user1, \"user2@example.com\";",
+        ] {
+            assert_command_identity(sql, DialectType::PostgreSQL);
+        }
+    }
+
+    #[test]
+    fn test_role_grants_without_on_in_other_supported_dialects() {
+        assert_command_identity(
+            "GRANT purchases_reader_role TO george, maria;",
+            DialectType::Oracle,
+        );
+        assert_command_identity(
+            "GRANT 'role1', 'role2' TO 'user1'@'localhost', 'user2'@'localhost';",
+            DialectType::MySQL,
+        );
+    }
+
+    #[test]
+    fn test_issue_379_role_grant_preserves_statement_boundaries() {
+        let sql = "SELECT set_config('session_authorization', 'abluva', false); GRANT abluva TO \"kk8529p@abluva.com\";";
+        let dialect = crate::dialects::Dialect::get(DialectType::PostgreSQL);
+        let parsed = dialect.parse(sql).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert!(matches!(&parsed[0], Expression::Select(_)));
+        assert!(matches!(&parsed[1], Expression::Command(_)));
+
+        let output = dialect.transpile(sql, DialectType::PostgreSQL).unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[1], "GRANT abluva TO \"kk8529p@abluva.com\"");
+    }
+
+    #[test]
+    fn test_postgres_role_revocations_without_on() {
+        for sql in [
+            "REVOKE developer_role FROM john;",
+            "REVOKE ADMIN OPTION FOR developer_role FROM john CASCADE;",
+            "REVOKE role1, role2 FROM user1, \"user2@example.com\" RESTRICT;",
+        ] {
+            assert_command_identity(sql, DialectType::PostgreSQL);
+        }
+    }
+
+    #[test]
+    fn test_object_grants_and_revocations_remain_structured() {
+        let grant = "GRANT SELECT ON TABLE users TO role1";
+        let parsed_grant = crate::parse_one(grant, DialectType::PostgreSQL).unwrap();
+        assert!(matches!(parsed_grant, Expression::Grant(_)));
+        assert_eq!(
+            crate::transpile(grant, DialectType::PostgreSQL, DialectType::PostgreSQL).unwrap(),
+            vec![grant]
+        );
+
+        let revoke = "REVOKE SELECT ON TABLE users FROM role1";
+        let parsed_revoke = crate::parse_one(revoke, DialectType::PostgreSQL).unwrap();
+        assert!(matches!(parsed_revoke, Expression::Revoke(_)));
+        assert_eq!(
+            crate::transpile(revoke, DialectType::PostgreSQL, DialectType::PostgreSQL).unwrap(),
+            vec![revoke]
+        );
     }
 }

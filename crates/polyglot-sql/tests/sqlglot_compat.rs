@@ -237,6 +237,69 @@ mod identity_tests {
 }
 
 // ============================================================================
+// Alias compatibility tests
+// Ported from sqlglot/tests/dialects/test_dialect.py::test_alias
+// ============================================================================
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    fn assert_string_alias(sql: &str, dialect: DialectType, expected: &str) {
+        let parsed = Dialect::get(dialect)
+            .parse(sql)
+            .unwrap_or_else(|error| panic!("{dialect:?} should parse {sql:?}: {error}"));
+        let Expression::Select(select) = &parsed[0] else {
+            panic!("expected SELECT for {dialect:?}: {sql}");
+        };
+        let Expression::Alias(alias) = &select.expressions[0] else {
+            panic!("expected projection alias for {dialect:?}: {sql}");
+        };
+
+        assert_eq!(alias.alias.name, "Column 1");
+        assert!(alias.alias.quoted, "alias should be a quoted identifier");
+        assert_eq!(transpile(sql, dialect, dialect), expected);
+    }
+
+    #[test]
+    fn test_string_projection_aliases() {
+        let cases = [
+            (DialectType::TSQL, "SELECT 1 AS [Column 1]"),
+            (DialectType::Fabric, "SELECT 1 AS [Column 1]"),
+            (DialectType::MySQL, "SELECT 1 AS `Column 1`"),
+            (DialectType::SQLite, "SELECT 1 AS \"Column 1\""),
+        ];
+
+        for (dialect, expected) in cases {
+            assert_string_alias("SELECT 1 AS 'Column 1'", dialect, expected);
+            assert_string_alias("SELECT 1 'Column 1'", dialect, expected);
+        }
+    }
+
+    #[test]
+    fn test_tsql_string_projection_alias_issue_375() {
+        let sql = "SELECT table.col1 AS 'Column 1' FROM table";
+        let expected = "SELECT table.col1 AS [Column 1] FROM table";
+
+        for dialect in [DialectType::TSQL, DialectType::Fabric] {
+            assert_string_alias(sql, dialect, expected);
+        }
+    }
+
+    #[test]
+    fn test_string_projection_aliases_are_dialect_gated() {
+        for dialect in [DialectType::Generic, DialectType::PostgreSQL] {
+            for sql in ["SELECT 1 AS 'Column 1'", "SELECT 1 'Column 1'"] {
+                assert!(
+                    Dialect::get(dialect).parse(sql).is_err(),
+                    "{dialect:?} should reject string projection alias {sql:?}"
+                );
+            }
+        }
+    }
+}
+
+// ============================================================================
 // DDL Identity Tests
 // Ported from sqlglot/tests/dialects/test_mysql.py and others
 // ============================================================================

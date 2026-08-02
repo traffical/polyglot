@@ -1301,8 +1301,6 @@ static DEFAULT_KEYWORDS: LazyLock<HashMap<String, TokenType>> = LazyLock::new(||
     keywords.insert("BERNOULLI".to_string(), TokenType::Bernoulli);
     keywords.insert("SYSTEM".to_string(), TokenType::System);
     keywords.insert("BLOCK".to_string(), TokenType::Block);
-    keywords.insert("SEED".to_string(), TokenType::Seed);
-    keywords.insert("REPEATABLE".to_string(), TokenType::Repeatable);
     keywords.insert("TIES".to_string(), TokenType::Ties);
     keywords.insert("LATERAL".to_string(), TokenType::Lateral);
     keywords.insert("LAMBDA".to_string(), TokenType::Lambda);

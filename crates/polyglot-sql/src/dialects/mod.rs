@@ -163,8 +163,8 @@ use crate::error::Result;
 #[cfg(feature = "transpile")]
 use crate::expressions::{
     BinaryOp, Case, Cast, ColumnConstraint, DateBin, Fetch, Function, Identifier, Interval,
-    IntervalUnit, IntervalUnitSpec, Literal, Offset, Over, Top, Var, WindowFrame, WindowFrameBound,
-    WindowFrameKind,
+    IntervalUnit, IntervalUnitSpec, Literal, Offset, Over, Select, Subquery, Top, Var, WindowFrame,
+    WindowFrameBound, WindowFrameKind,
 };
 use crate::expressions::{DataType, Expression};
 #[cfg(any(
@@ -181,6 +181,8 @@ use crate::generator::{Generator, GeneratorConfig};
 #[cfg(feature = "transpile")]
 use crate::guard::enforce_generate_ast;
 use crate::guard::{enforce_input, ComplexityGuardOptions};
+#[cfg(feature = "transpile")]
+use crate::helper::find_new_name;
 use crate::parser::Parser;
 #[cfg(feature = "transpile")]
 use crate::tokens::TokenType;
@@ -272,6 +274,16 @@ pub enum DialectType {
     Exasol,
     /// Apache DataFusion -- Arrow-based query engine with modern SQL extensions.
     DataFusion,
+}
+
+impl DialectType {
+    /// Whether SELECT projections may use string literals as column aliases.
+    pub(crate) const fn supports_string_aliases(self) -> bool {
+        matches!(
+            self,
+            DialectType::TSQL | DialectType::Fabric | DialectType::MySQL | DialectType::SQLite
+        )
+    }
 }
 
 impl Default for DialectType {
@@ -3858,6 +3870,14 @@ impl Dialect {
                     normalized
                 };
 
+                let normalized = if self.dialect_type == DialectType::PostgreSQL
+                    && matches!(target, DialectType::TSQL | DialectType::Fabric)
+                {
+                    Self::normalize_postgres_bytea_literals_for_tsql(normalized)?
+                } else {
+                    normalized
+                };
+
                 let normalized = if matches!(
                     self.dialect_type,
                     DialectType::PostgreSQL | DialectType::CockroachDB
@@ -3917,6 +3937,11 @@ impl Dialect {
                 let normalized = if matches!(target, DialectType::TSQL | DialectType::Fabric)
                     && !matches!(self.dialect_type, DialectType::TSQL | DialectType::Fabric)
                 {
+                    let normalized = if self.dialect_type == DialectType::PostgreSQL {
+                        Self::rewrite_postgres_row_value_equality_for_tsql(normalized)?
+                    } else {
+                        normalized
+                    };
                     Self::rewrite_boolean_values_for_tsql(normalized)?
                 } else {
                     normalized
@@ -4421,6 +4446,16 @@ impl Dialect {
                             &mut diagnostics,
                             &format!("PostgreSQL {string_semantics}"),
                         );
+                    }
+                    if source == DialectType::PostgreSQL {
+                        if let Some(binary_semantics) =
+                            Self::postgres_tsql_unsupported_binary_semantics(node)
+                        {
+                            Self::push_unsupported_diagnostic(
+                                &mut diagnostics,
+                                &format!("PostgreSQL {binary_semantics}"),
+                            );
+                        }
                     }
                     if let Some(function_name) =
                         Self::postgres_tsql_unsupported_function_name(node, target)
@@ -6093,6 +6128,110 @@ impl Dialect {
         })
     }
 
+    fn normalize_postgres_bytea_literals_for_tsql(expr: Expression) -> Result<Expression> {
+        transform_recursive(expr, &|e| match e {
+            Expression::Cast(cast) if Self::is_postgres_bytea_data_type(&cast.to) => {
+                let Some(value) = Self::postgres_plain_string_literal_value(&cast.this) else {
+                    return Ok(Expression::Cast(cast));
+                };
+                let Some(hex) = Self::postgres_bytea_hex_payload(value) else {
+                    return Ok(Expression::Cast(cast));
+                };
+
+                // Replace the complete BYTEA cast. Keeping a bare T-SQL
+                // CAST(... AS VARBINARY) would apply SQL Server's default length
+                // and could truncate payloads longer than 30 bytes.
+                Ok(Expression::Literal(Box::new(Literal::HexString(hex))))
+            }
+            other => Ok(other),
+        })
+    }
+
+    fn postgres_plain_string_literal_value(expr: &Expression) -> Option<&str> {
+        match expr {
+            Expression::Literal(literal) => match literal.as_ref() {
+                Literal::String(value) => Some(value),
+                _ => None,
+            },
+            Expression::Paren(paren) => Self::postgres_plain_string_literal_value(&paren.this),
+            _ => None,
+        }
+    }
+
+    fn postgres_bytea_hex_payload(value: &str) -> Option<String> {
+        let payload = value.strip_prefix("\\x")?;
+        if payload.is_empty() {
+            return Some(String::new());
+        }
+
+        let mut chars = payload.chars().peekable();
+        let mut hex = String::with_capacity(payload.len());
+        loop {
+            let high = chars.next()?;
+            let low = chars.next()?;
+            if !high.is_ascii_hexdigit() || !low.is_ascii_hexdigit() {
+                return None;
+            }
+            hex.push(high);
+            hex.push(low);
+
+            let Some(next) = chars.peek().copied() else {
+                return Some(hex);
+            };
+            if next.is_ascii_whitespace() {
+                while chars
+                    .peek()
+                    .is_some_and(|character| character.is_ascii_whitespace())
+                {
+                    chars.next();
+                }
+                // PostgreSQL permits whitespace between byte pairs, not after
+                // the prefix or after the final pair.
+                chars.peek()?;
+            }
+        }
+    }
+
+    fn is_postgres_bytea_data_type(data_type: &DataType) -> bool {
+        match data_type {
+            DataType::VarBinary { length: None } => true,
+            DataType::Custom { name } => name.trim().eq_ignore_ascii_case("BYTEA"),
+            _ => false,
+        }
+    }
+
+    fn postgres_tsql_unsupported_binary_semantics(expr: &Expression) -> Option<&'static str> {
+        let cast = match expr {
+            Expression::Cast(cast) | Expression::TryCast(cast) | Expression::SafeCast(cast)
+                if Self::is_postgres_bytea_data_type(&cast.to) =>
+            {
+                cast
+            }
+            _ => return None,
+        };
+
+        let literal = match &cast.this {
+            Expression::Literal(literal) => literal.as_ref(),
+            Expression::Paren(paren) => match &paren.this {
+                Expression::Literal(literal) => literal.as_ref(),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let value = match literal {
+            Literal::String(value) | Literal::EscapeString(value) => value,
+            _ => return None,
+        };
+
+        if value.starts_with("\\x") {
+            Some("bytea hex literals with invalid or unsupported formatting")
+        } else if value.contains('\\') {
+            Some("bytea escape-format literals")
+        } else {
+            None
+        }
+    }
+
     fn recover_postgres_like_escape(op: &mut crate::expressions::LikeOp) {
         if op.escape.is_some() {
             return;
@@ -6613,6 +6752,247 @@ impl Dialect {
                 Ok(Expression::Except(except))
             }
             other => Self::rewrite_tsql_boolean_nested_contexts(other),
+        }
+    }
+
+    fn rewrite_postgres_row_value_equality_for_tsql(expr: Expression) -> Result<Expression> {
+        transform_recursive(expr, &|e| match e {
+            Expression::Eq(op) => {
+                let op = *op;
+                Ok(Self::postgres_row_value_equality_to_tsql_scalar(&op)
+                    .unwrap_or_else(|| Expression::Eq(Box::new(op))))
+            }
+            other => Ok(other),
+        })
+    }
+
+    fn postgres_row_value_equality_to_tsql_scalar(op: &BinaryOp) -> Option<Expression> {
+        let (row, query) =
+            if Self::expr_is_row_value(&op.left) && Self::expr_is_subquery_like(&op.right) {
+                (&op.left, &op.right)
+            } else if Self::expr_is_row_value(&op.right) && Self::expr_is_subquery_like(&op.left) {
+                (&op.right, &op.left)
+            } else {
+                return None;
+            };
+
+        let row_values = Self::row_value_expressions(row)?;
+        let projection_count = Self::subquery_projection_count(query)?;
+        if row_values.is_empty() || row_values.len() != projection_count {
+            return None;
+        }
+
+        // Keep the complete original query behind a derived table. The outer scalar
+        // SELECT therefore returns the same number of rows as the PostgreSQL
+        // single-row subquery: zero rows stay NULL and multiple rows still raise a
+        // scalar-subquery cardinality error in T-SQL/Fabric.
+        let mut taken_names = HashSet::new();
+        Self::collect_generated_alias_conflicts(row, &mut taken_names);
+        Self::collect_generated_alias_conflicts(query, &mut taken_names);
+
+        let source_alias = find_new_name(&taken_names, "_polyglot_row");
+        taken_names.insert(source_alias.to_ascii_lowercase());
+        let column_aliases = (1..=row_values.len())
+            .map(|index| {
+                let name = find_new_name(&taken_names, &format!("_polyglot_row_value_{index}"));
+                taken_names.insert(name.to_ascii_lowercase());
+                Identifier::new(name)
+            })
+            .collect::<Vec<_>>();
+        let source = Self::subquery_as_derived_table(
+            query,
+            Identifier::new(&source_alias),
+            column_aliases.clone(),
+        )?;
+
+        let mut equal_components = Vec::with_capacity(row_values.len());
+        let mut unequal_components = Vec::with_capacity(row_values.len());
+        for (column, row_value) in column_aliases.into_iter().zip(row_values) {
+            let projected = Expression::qualified_column(source_alias.clone(), column.name);
+            equal_components.push(Expression::Eq(Box::new(BinaryOp::new(
+                projected.clone(),
+                row_value.clone(),
+            ))));
+            unequal_components.push(Expression::Neq(Box::new(BinaryOp::new(
+                projected, row_value,
+            ))));
+        }
+
+        let all_equal = equal_components
+            .into_iter()
+            .reduce(|left, right| Expression::And(Box::new(BinaryOp::new(left, right))))?;
+        let any_unequal = unequal_components
+            .into_iter()
+            .reduce(|left, right| Expression::Or(Box::new(BinaryOp::new(left, right))))?;
+        let comparison = Expression::Case(Box::new(Case {
+            operand: None,
+            whens: vec![
+                (all_equal, Expression::number(1)),
+                (any_unequal, Expression::number(0)),
+            ],
+            else_: Some(Expression::null()),
+            comments: Vec::new(),
+            inferred_type: None,
+        }));
+
+        let scalar_select = Select::new().column(comparison).from(source);
+        let scalar_subquery = Expression::Subquery(Box::new(Subquery {
+            this: Expression::Select(Box::new(scalar_select)),
+            alias: None,
+            column_aliases: Vec::new(),
+            alias_explicit_as: false,
+            alias_keyword: None,
+            order_by: None,
+            limit: None,
+            offset: None,
+            distribute_by: None,
+            sort_by: None,
+            cluster_by: None,
+            lateral: false,
+            modifiers_inside: false,
+            trailing_comments: Vec::new(),
+            inferred_type: Some(DataType::Boolean),
+        }));
+
+        Some(Expression::Cast(Box::new(Cast {
+            this: scalar_subquery,
+            to: DataType::Boolean,
+            trailing_comments: Vec::new(),
+            double_colon_syntax: false,
+            format: None,
+            default: None,
+            inferred_type: Some(DataType::Boolean),
+        })))
+    }
+
+    fn row_value_expressions(expr: &Expression) -> Option<Vec<Expression>> {
+        match expr {
+            Expression::Tuple(tuple) => Some(tuple.expressions.clone()),
+            Expression::Function(function) if function.name.eq_ignore_ascii_case("ROW") => {
+                Some(function.args.clone())
+            }
+            Expression::Paren(paren) => Self::row_value_expressions(&paren.this),
+            _ => None,
+        }
+    }
+
+    fn subquery_projection_count(expr: &Expression) -> Option<usize> {
+        match expr {
+            Expression::Select(select) => Some(select.expressions.len()),
+            Expression::Subquery(subquery) => Self::subquery_projection_count(&subquery.this),
+            Expression::Paren(paren) => Self::subquery_projection_count(&paren.this),
+            _ => None,
+        }
+    }
+
+    fn subquery_as_derived_table(
+        expr: &Expression,
+        alias: Identifier,
+        column_aliases: Vec<Identifier>,
+    ) -> Option<Expression> {
+        match expr.clone() {
+            Expression::Subquery(mut subquery) => {
+                subquery.alias = Some(alias);
+                subquery.column_aliases = column_aliases;
+                subquery.alias_explicit_as = true;
+                subquery.alias_keyword = None;
+                Some(Expression::Subquery(subquery))
+            }
+            Expression::Select(_) | Expression::Paren(_) => {
+                Some(Expression::Subquery(Box::new(Subquery {
+                    this: expr.clone(),
+                    alias: Some(alias),
+                    column_aliases,
+                    alias_explicit_as: true,
+                    alias_keyword: None,
+                    order_by: None,
+                    limit: None,
+                    offset: None,
+                    distribute_by: None,
+                    sort_by: None,
+                    cluster_by: None,
+                    lateral: false,
+                    modifiers_inside: false,
+                    trailing_comments: Vec::new(),
+                    inferred_type: None,
+                })))
+            }
+            _ => None,
+        }
+    }
+
+    fn collect_generated_alias_conflicts(expr: &Expression, names: &mut HashSet<String>) {
+        fn insert(names: &mut HashSet<String>, identifier: &Identifier) {
+            if !identifier.name.is_empty() {
+                names.insert(identifier.name.to_ascii_lowercase());
+            }
+        }
+
+        for node in expr.dfs() {
+            match node {
+                Expression::Identifier(identifier) => insert(names, identifier),
+                Expression::Column(column) => {
+                    insert(names, &column.name);
+                    if let Some(table) = &column.table {
+                        insert(names, table);
+                    }
+                }
+                Expression::Table(table) => {
+                    insert(names, &table.name);
+                    if let Some(schema) = &table.schema {
+                        insert(names, schema);
+                    }
+                    if let Some(catalog) = &table.catalog {
+                        insert(names, catalog);
+                    }
+                    if let Some(alias) = &table.alias {
+                        insert(names, alias);
+                    }
+                    for alias in &table.column_aliases {
+                        insert(names, alias);
+                    }
+                }
+                Expression::Alias(alias) => {
+                    insert(names, &alias.alias);
+                    for column_alias in &alias.column_aliases {
+                        insert(names, column_alias);
+                    }
+                }
+                Expression::Subquery(subquery) => {
+                    if let Some(alias) = &subquery.alias {
+                        insert(names, alias);
+                    }
+                    for column_alias in &subquery.column_aliases {
+                        insert(names, column_alias);
+                    }
+                }
+                Expression::Cte(cte) => {
+                    insert(names, &cte.alias);
+                    for column in &cte.columns {
+                        insert(names, column);
+                    }
+                    for key in &cte.key_expressions {
+                        insert(names, key);
+                    }
+                }
+                Expression::Values(values) => {
+                    if let Some(alias) = &values.alias {
+                        insert(names, alias);
+                    }
+                    for column_alias in &values.column_aliases {
+                        insert(names, column_alias);
+                    }
+                }
+                Expression::Unnest(unnest) => {
+                    if let Some(alias) = &unnest.alias {
+                        insert(names, alias);
+                    }
+                    if let Some(offset_alias) = &unnest.offset_alias {
+                        insert(names, offset_alias);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 

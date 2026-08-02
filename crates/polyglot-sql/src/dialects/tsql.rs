@@ -14,8 +14,8 @@ use super::{DialectImpl, DialectType};
 use crate::error::Result;
 use crate::expressions::{
     Alias, BinaryOp, Cast, Column, Cte, DataType, Exists, Expression, From, Function, Identifier,
-    In, Join, JoinKind, LikeOp, Literal, Null, Over, Paren, QuantifiedOp, Select, Star,
-    StringAggFunc, Subquery, TrimFunc, TrimPosition, Tuple, UnaryFunc, Values, Where,
+    In, Join, JoinKind, LikeOp, Literal, Null, Over, Paren, QuantifiedExpr, QuantifiedOp, Select,
+    Star, StringAggFunc, Subquery, TrimFunc, TrimPosition, Tuple, UnaryFunc, Values, Where,
     WindowFunction,
 };
 #[cfg(feature = "generate")]
@@ -697,26 +697,13 @@ impl DialectImpl for TSQLDialect {
             )))),
 
             // PostgreSQL pg_get_querydef can emit scalar array comparisons for
-            // literal arrays/tuples. T-SQL/Fabric require IN for this shape.
-            Expression::Any(ref q) if matches!(&q.op, Some(QuantifiedOp::Eq)) => {
-                match Self::scalar_array_comparison_values(&q.subquery) {
-                    Some(expressions) if expressions.is_empty() => {
-                        Ok(Expression::Eq(Box::new(crate::expressions::BinaryOp::new(
-                            Expression::Literal(Box::new(Literal::Number("1".to_string()))),
-                            Expression::Literal(Box::new(Literal::Number("0".to_string()))),
-                        ))))
-                    }
-                    Some(expressions) => Ok(Expression::In(Box::new(In {
-                        this: q.this.clone(),
-                        expressions,
-                        query: None,
-                        not: false,
-                        global: false,
-                        unnest: None,
-                        is_field: false,
-                    }))),
-                    None => Ok(expr.clone()),
-                }
+            // literal arrays/tuples. T-SQL/Fabric require scalar predicates for
+            // these shapes because quantified comparisons only accept subqueries.
+            Expression::Any(q) => {
+                Ok(Self::lower_scalar_array_quantifier(&q, true).unwrap_or(Expression::Any(q)))
+            }
+            Expression::All(q) => {
+                Ok(Self::lower_scalar_array_quantifier(&q, false).unwrap_or(Expression::All(q)))
             }
 
             // Pass through everything else
@@ -974,7 +961,9 @@ impl TSQLDialect {
                     }
                 }
                 '.' if !saw_decimal => saw_decimal = true,
-                ',' | ' ' => {}
+                // Group separators and positional whitespace have format-model
+                // semantics that a raw TRY_CONVERT cannot reproduce.
+                ',' | ' ' => return None,
                 _ => return None,
             }
         }
@@ -1130,6 +1119,67 @@ impl TSQLDialect {
                 .collect();
         }
         Some(values)
+    }
+
+    fn lower_scalar_array_quantifier(
+        quantified: &QuantifiedExpr,
+        is_any: bool,
+    ) -> Option<Expression> {
+        let op = quantified.op.as_ref()?;
+        let expressions = Self::scalar_array_comparison_values(&quantified.subquery)?;
+
+        if expressions.is_empty() {
+            return Some(Self::eq(
+                Expression::number(1),
+                Expression::number(if is_any { 0 } else { 1 }),
+            ));
+        }
+
+        if is_any && matches!(op, QuantifiedOp::Eq) {
+            return Some(Self::in_list(quantified.this.clone(), expressions, false));
+        }
+
+        if !is_any && matches!(op, QuantifiedOp::Neq) {
+            return Some(Self::in_list(quantified.this.clone(), expressions, true));
+        }
+
+        let mut comparisons = expressions
+            .into_iter()
+            .map(|expression| Self::quantified_comparison(quantified.this.clone(), expression, op));
+        let first = comparisons.next()?;
+        let combined = comparisons.fold(first, |left, right| {
+            if is_any {
+                Expression::Or(Box::new(BinaryOp::new(left, right)))
+            } else {
+                Expression::And(Box::new(BinaryOp::new(left, right)))
+            }
+        });
+
+        Some(Self::paren(combined))
+    }
+
+    fn in_list(this: Expression, expressions: Vec<Expression>, not: bool) -> Expression {
+        Expression::In(Box::new(In {
+            this,
+            expressions,
+            query: None,
+            not,
+            global: false,
+            unnest: None,
+            is_field: false,
+        }))
+    }
+
+    fn quantified_comparison(left: Expression, right: Expression, op: &QuantifiedOp) -> Expression {
+        let binary = Box::new(BinaryOp::new(left, right));
+        match op {
+            QuantifiedOp::Eq => Expression::Eq(binary),
+            QuantifiedOp::Neq => Expression::Neq(binary),
+            QuantifiedOp::Lt => Expression::Lt(binary),
+            QuantifiedOp::Lte => Expression::Lte(binary),
+            QuantifiedOp::Gt => Expression::Gt(binary),
+            QuantifiedOp::Gte => Expression::Gte(binary),
+        }
     }
 
     fn scalar_array_comparison_values_inner(
@@ -3517,6 +3567,30 @@ mod tests {
     fn test_length_to_len() {
         let result = transpile_to_tsql("SELECT LENGTH(name)");
         assert!(result.contains("LEN"), "Expected LEN, got: {}", result);
+    }
+
+    #[test]
+    fn test_issue_374_tsql_parse_then_generate_uses_len() {
+        let sql = "SELECT LEN(table.col1) - LEN(table.col2) FROM table";
+        let ast = Dialect::get(DialectType::TSQL)
+            .parse(sql)
+            .expect("T-SQL should parse");
+        let expression = &ast[0];
+
+        for target in [DialectType::TSQL, DialectType::Fabric] {
+            let generated = Dialect::get(target)
+                .generate(expression)
+                .expect("AST should generate");
+            assert_eq!(generated, sql, "failed for target {target:?}");
+        }
+
+        let standard_sql = "SELECT LENGTH(table.col1) - LENGTH(table.col2) FROM table";
+        for target in [DialectType::Generic, DialectType::PostgreSQL] {
+            let generated = Dialect::get(target)
+                .generate(expression)
+                .expect("AST should generate");
+            assert_eq!(generated, standard_sql, "failed for target {target:?}");
+        }
     }
 
     #[test]
