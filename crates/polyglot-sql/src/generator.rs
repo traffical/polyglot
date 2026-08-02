@@ -10381,6 +10381,7 @@ impl Generator {
             TableConstraint::Index {
                 name,
                 columns,
+                key_parts,
                 kind,
                 modifiers,
                 use_key_keyword,
@@ -10462,13 +10463,17 @@ impl Generator {
                         }
                     }
 
-                    // Output columns
+                    // Output columns / functional key parts
                     self.write(" (");
-                    for (i, col) in columns.iter().enumerate() {
-                        if i > 0 {
-                            self.write(", ");
+                    if key_parts.is_empty() {
+                        for (i, col) in columns.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.generate_identifier(col)?;
                         }
-                        self.generate_identifier(col)?;
+                    } else {
+                        self.generate_index_key_parts(key_parts)?;
                     }
                     self.write(")");
 
@@ -11982,7 +11987,7 @@ impl Generator {
 
         // Column list (optional for COLUMNSTORE indexes)
         // Standard SQL convention: ON t(a) without space before paren
-        if !ci.columns.is_empty() || ci.using.is_some() {
+        if !ci.columns.is_empty() || !ci.key_parts.is_empty() || ci.using.is_some() {
             let space_before_paren = false;
 
             if let Some(ref using) = ci.using {
@@ -12002,28 +12007,32 @@ impl Generator {
                     self.write("(");
                 }
             }
-            for (i, col) in ci.columns.iter().enumerate() {
-                if i > 0 {
-                    self.write(", ");
+            if ci.key_parts.is_empty() {
+                for (i, col) in ci.columns.iter().enumerate() {
+                    if i > 0 {
+                        self.write(", ");
+                    }
+                    self.generate_identifier(&col.column)?;
+                    if let Some(ref opclass) = col.opclass {
+                        self.write_space();
+                        self.write(opclass);
+                    }
+                    if col.desc {
+                        self.write_space();
+                        self.write_keyword("DESC");
+                    } else if col.asc {
+                        self.write_space();
+                        self.write_keyword("ASC");
+                    }
+                    if let Some(nulls_first) = col.nulls_first {
+                        self.write_space();
+                        self.write_keyword("NULLS");
+                        self.write_space();
+                        self.write_keyword(if nulls_first { "FIRST" } else { "LAST" });
+                    }
                 }
-                self.generate_identifier(&col.column)?;
-                if let Some(ref opclass) = col.opclass {
-                    self.write_space();
-                    self.write(opclass);
-                }
-                if col.desc {
-                    self.write_space();
-                    self.write_keyword("DESC");
-                } else if col.asc {
-                    self.write_space();
-                    self.write_keyword("ASC");
-                }
-                if let Some(nulls_first) = col.nulls_first {
-                    self.write_space();
-                    self.write_keyword("NULLS");
-                    self.write_space();
-                    self.write_keyword(if nulls_first { "FIRST" } else { "LAST" });
-                }
+            } else {
+                self.generate_index_key_parts(&ci.key_parts)?;
             }
             self.write(")");
         }
@@ -12074,6 +12083,38 @@ impl Generator {
             self.write(on_fg);
         }
 
+        Ok(())
+    }
+
+    fn generate_index_key_parts(&mut self, key_parts: &[IndexKeyPart]) -> Result<()> {
+        for (i, part) in key_parts.iter().enumerate() {
+            if i > 0 {
+                self.write(", ");
+            }
+            self.generate_expression(&part.expression)?;
+            if let Some(ref prefix_length) = part.prefix_length {
+                self.write("(");
+                self.write(prefix_length);
+                self.write(")");
+            }
+            if let Some(ref opclass) = part.opclass {
+                self.write_space();
+                self.write(opclass);
+            }
+            if part.desc {
+                self.write_space();
+                self.write_keyword("DESC");
+            } else if part.asc {
+                self.write_space();
+                self.write_keyword("ASC");
+            }
+            if let Some(nulls_first) = part.nulls_first {
+                self.write_space();
+                self.write_keyword("NULLS");
+                self.write_space();
+                self.write_keyword(if nulls_first { "FIRST" } else { "LAST" });
+            }
+        }
         Ok(())
     }
 

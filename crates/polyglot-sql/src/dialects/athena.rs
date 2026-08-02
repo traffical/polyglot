@@ -147,6 +147,7 @@ impl DialectImpl for AthenaDialect {
                     with_ordinality: false,
                     alias: None,
                     offset_alias: None,
+                    inferred_type: None,
                 },
             ))),
 
@@ -158,6 +159,7 @@ impl DialectImpl for AthenaDialect {
                     with_ordinality: false,
                     alias: None,
                     offset_alias: None,
+                    inferred_type: None,
                 },
             ))),
 

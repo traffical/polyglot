@@ -9,14 +9,14 @@
 //!
 //! Based on SQLGlot's optimizer/annotate_types.py
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::dialects::DialectType;
 use crate::expressions::{
     BinaryOp, DataType, Expression, Function, IfFunc, ListAggOverflow, Literal, Map, Nvl2Func,
     Struct, StructField, Subscript,
 };
-use crate::schema::Schema;
+use crate::schema::{normalize_name, Schema, SchemaError, SchemaResult, TABLE_PARTS};
 
 /// Type coercion class for determining result types in binary operations.
 /// Higher-priority classes win during coercion.
@@ -825,6 +825,12 @@ impl<'a> TypeAnnotator<'a> {
                     self.annotate_in_place(arg);
                 }
             }
+            Expression::Unnest(unnest) => {
+                self.annotate_in_place(&mut unnest.this);
+                for expression in &mut unnest.expressions {
+                    self.annotate_in_place(expression);
+                }
+            }
 
             // Dedicated conditional functions
             Expression::IfFunc(f) => {
@@ -1245,6 +1251,10 @@ impl<'a> TypeAnnotator<'a> {
 
         // For functions with Unknown return type, infer from arguments
         match func_name.as_str() {
+            "UNNEST" => func.args.first().and_then(|arg| match self.annotate(arg) {
+                Some(DataType::Array { element_type, .. }) => Some(*element_type),
+                _ => None,
+            }),
             "COALESCE" | "IFNULL" | "NVL" | "ISNULL" => {
                 // Return type of first non-null argument
                 for arg in &func.args {
@@ -1484,6 +1494,437 @@ impl<'a> TypeAnnotator<'a> {
     }
 }
 
+/// A schema layer whose entries are visible only while annotating one query
+/// scope. The parent contains physical tables and any correlated outer scope;
+/// CTE, derived-table, table-alias, and table-valued-function outputs stay in
+/// this layer and therefore cannot leak into sibling scopes.
+struct ScopedSchema<'a> {
+    parent: Option<&'a dyn Schema>,
+    tables: HashMap<String, HashMap<String, DataType>>,
+    dialect: Option<DialectType>,
+}
+
+impl<'a> ScopedSchema<'a> {
+    fn new(parent: Option<&'a dyn Schema>, dialect: Option<DialectType>) -> Self {
+        Self {
+            parent,
+            tables: HashMap::new(),
+            dialect,
+        }
+    }
+
+    fn normalized(&self, name: &str, is_table: bool) -> String {
+        normalize_name(name, self.dialect, is_table, true)
+    }
+
+    fn local_column_type(&self, table: &str, column: &str) -> Option<DataType> {
+        let table = self.normalized(table, true);
+        let column = self.normalized(column, false);
+        self.tables
+            .get(&table)
+            .and_then(|columns| columns.get(&column))
+            .cloned()
+    }
+
+    fn local_tables_for_column(&self, column: &str) -> Vec<String> {
+        let column = self.normalized(column, false);
+        self.tables
+            .iter()
+            .filter_map(|(table, columns)| columns.contains_key(&column).then(|| table.clone()))
+            .collect()
+    }
+}
+
+impl Schema for ScopedSchema<'_> {
+    fn dialect(&self) -> Option<DialectType> {
+        self.dialect
+            .or_else(|| self.parent.and_then(Schema::dialect))
+    }
+
+    fn add_table(
+        &mut self,
+        table: &str,
+        columns: &[(String, DataType)],
+        _dialect: Option<DialectType>,
+    ) -> SchemaResult<()> {
+        let table = self.normalized(table, true);
+        let columns = columns
+            .iter()
+            .map(|(name, data_type)| (self.normalized(name, false), data_type.clone()))
+            .collect();
+        self.tables.insert(table, columns);
+        Ok(())
+    }
+
+    fn column_names(&self, table: &str) -> SchemaResult<Vec<String>> {
+        let table = self.normalized(table, true);
+        if let Some(columns) = self.tables.get(&table) {
+            return Ok(columns.keys().cloned().collect());
+        }
+        self.parent
+            .ok_or_else(|| SchemaError::TableNotFound(table.clone()))?
+            .column_names(&table)
+    }
+
+    fn get_column_type(&self, table: &str, column: &str) -> SchemaResult<DataType> {
+        if table.is_empty() {
+            let local_tables = self.local_tables_for_column(column);
+            return match local_tables.as_slice() {
+                [local_table] => self.get_column_type(local_table, column),
+                [] => self
+                    .parent
+                    .ok_or_else(|| SchemaError::ColumnNotFound {
+                        table: String::new(),
+                        column: column.to_string(),
+                    })?
+                    .get_column_type(table, column),
+                _ => Err(SchemaError::AmbiguousTable {
+                    table: String::new(),
+                    matches: local_tables.join(", "),
+                }),
+            };
+        }
+
+        let normalized_table = self.normalized(table, true);
+        if self.tables.contains_key(&normalized_table) {
+            return self.local_column_type(table, column).ok_or_else(|| {
+                SchemaError::ColumnNotFound {
+                    table: table.to_string(),
+                    column: column.to_string(),
+                }
+            });
+        }
+
+        self.parent
+            .ok_or_else(|| SchemaError::ColumnNotFound {
+                table: table.to_string(),
+                column: column.to_string(),
+            })?
+            .get_column_type(table, column)
+    }
+
+    fn has_column(&self, table: &str, column: &str) -> bool {
+        self.get_column_type(table, column).is_ok()
+    }
+
+    fn supported_table_args(&self) -> &[&str] {
+        TABLE_PARTS
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tables.is_empty() && self.parent.is_none_or(Schema::is_empty)
+    }
+
+    fn depth(&self) -> usize {
+        self.parent.map_or(1, |schema| schema.depth().max(1))
+    }
+
+    fn find_tables_for_column(&self, column: &str) -> Vec<String> {
+        let mut tables = self.local_tables_for_column(column);
+        if let Some(parent) = self.parent {
+            tables.extend(parent.find_tables_for_column(column));
+        }
+        let mut seen = HashSet::new();
+        tables.retain(|table| seen.insert(table.clone()));
+        tables
+    }
+}
+
+type OutputColumns = Vec<(String, DataType)>;
+
+fn table_name(table: &crate::expressions::TableRef) -> String {
+    let mut parts = Vec::new();
+    if let Some(catalog) = &table.catalog {
+        parts.push(catalog.name.as_str());
+    }
+    if let Some(schema) = &table.schema {
+        parts.push(schema.name.as_str());
+    }
+    parts.push(table.name.name.as_str());
+    parts.join(".")
+}
+
+fn table_columns(schema: &dyn Schema, table: &str) -> OutputColumns {
+    schema
+        .column_names(table)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|column| {
+            let data_type = schema
+                .get_column_type(table, &column)
+                .unwrap_or(DataType::Unknown);
+            (column, data_type)
+        })
+        .collect()
+}
+
+fn apply_column_aliases(
+    mut columns: OutputColumns,
+    aliases: &[crate::expressions::Identifier],
+) -> OutputColumns {
+    for ((name, _), alias) in columns.iter_mut().zip(aliases) {
+        *name = alias.name.clone();
+    }
+    columns
+}
+
+fn projection_name(expression: &Expression) -> Option<String> {
+    match expression {
+        Expression::Alias(alias) => Some(alias.alias.name.clone()),
+        Expression::Column(column) => Some(column.name.name.clone()),
+        Expression::Identifier(identifier) => Some(identifier.name.clone()),
+        _ => None,
+    }
+}
+
+fn projection_type(expression: &Expression) -> DataType {
+    expression
+        .inferred_type()
+        .or_else(|| match expression {
+            Expression::Alias(alias) => alias.this.inferred_type(),
+            _ => None,
+        })
+        .cloned()
+        .unwrap_or(DataType::Unknown)
+}
+
+fn query_outputs(expressions: &[Expression]) -> OutputColumns {
+    expressions
+        .iter()
+        .filter_map(|expression| {
+            projection_name(expression).map(|name| (name, projection_type(expression)))
+        })
+        .collect()
+}
+
+fn array_element_type(data_type: Option<&DataType>) -> DataType {
+    match data_type {
+        Some(DataType::Array { element_type, .. }) => (**element_type).clone(),
+        _ => DataType::Unknown,
+    }
+}
+
+fn unnest_output_types(unnest: &crate::expressions::UnnestFunc) -> Vec<DataType> {
+    let mut types = vec![array_element_type(unnest.this.inferred_type())];
+    types.extend(
+        unnest
+            .expressions
+            .iter()
+            .map(|expression| array_element_type(expression.inferred_type())),
+    );
+    if unnest.with_ordinality || unnest.offset_alias.is_some() {
+        types.push(DataType::BigInt { length: None });
+    }
+    types
+}
+
+fn virtual_output_columns(
+    expression: &Expression,
+    source_alias: &str,
+    column_aliases: &[crate::expressions::Identifier],
+) -> OutputColumns {
+    let (types, offset_alias) = match expression {
+        Expression::Unnest(unnest) => (unnest_output_types(unnest), unnest.offset_alias.as_ref()),
+        Expression::Explode(explode) | Expression::ExplodeOuter(explode) => {
+            (vec![array_element_type(explode.this.inferred_type())], None)
+        }
+        Expression::Function(function) if function.name.eq_ignore_ascii_case("UNNEST") => (
+            function
+                .args
+                .iter()
+                .map(|argument| array_element_type(argument.inferred_type()))
+                .collect(),
+            None,
+        ),
+        _ => return Vec::new(),
+    };
+
+    if column_aliases.is_empty() {
+        let mut columns = Vec::new();
+        if let Some(data_type) = types.first() {
+            columns.push((source_alias.to_string(), data_type.clone()));
+        }
+        if let Some(offset_alias) = offset_alias {
+            columns.push((offset_alias.name.clone(), DataType::BigInt { length: None }));
+        }
+        columns
+    } else {
+        column_aliases
+            .iter()
+            .zip(types)
+            .map(|(alias, data_type)| (alias.name.clone(), data_type))
+            .collect()
+    }
+}
+
+fn annotate_relation_source(
+    expression: &mut Expression,
+    schema: &mut ScopedSchema<'_>,
+    dialect: Option<DialectType>,
+) {
+    match expression {
+        Expression::Table(table) => {
+            let source_table = table_name(table);
+            let mut columns = table_columns(schema, &source_table);
+            columns = apply_column_aliases(columns, &table.column_aliases);
+            let visible_name = table
+                .alias
+                .as_ref()
+                .map(|alias| alias.name.as_str())
+                .unwrap_or(table.name.name.as_str());
+            let _ = schema.add_table(visible_name, &columns, dialect);
+        }
+        Expression::Subquery(subquery) => {
+            let mut columns = annotate_scoped_expression(&mut subquery.this, Some(schema), dialect);
+            columns = apply_column_aliases(columns, &subquery.column_aliases);
+            if let Some((_, first_type)) = columns.first() {
+                subquery.inferred_type = Some(first_type.clone());
+            }
+            if let Some(alias) = &subquery.alias {
+                let _ = schema.add_table(&alias.name, &columns, dialect);
+            }
+        }
+        Expression::Alias(alias) => {
+            match &mut alias.this {
+                Expression::Subquery(subquery) => {
+                    let columns =
+                        annotate_scoped_expression(&mut subquery.this, Some(schema), dialect);
+                    let columns = apply_column_aliases(columns, &alias.column_aliases);
+                    let _ = schema.add_table(&alias.alias.name, &columns, dialect);
+                    return;
+                }
+                _ => {
+                    let mut annotator = TypeAnnotator::new(Some(schema), dialect);
+                    annotator.annotate_in_place(&mut alias.this);
+                }
+            }
+            let columns =
+                virtual_output_columns(&alias.this, &alias.alias.name, &alias.column_aliases);
+            if !columns.is_empty() {
+                let _ = schema.add_table(&alias.alias.name, &columns, dialect);
+            }
+        }
+        Expression::Unnest(_) => {
+            let mut annotator = TypeAnnotator::new(Some(schema), dialect);
+            annotator.annotate_in_place(expression);
+            if let Expression::Unnest(unnest) = expression {
+                if let Some(alias) = &unnest.alias {
+                    let alias_name = alias.name.clone();
+                    let columns = unnest_output_types(unnest)
+                        .into_iter()
+                        .next()
+                        .map(|data_type| vec![(alias_name.clone(), data_type)])
+                        .unwrap_or_default();
+                    let _ = schema.add_table(&alias_name, &columns, dialect);
+                }
+            }
+        }
+        Expression::Lateral(lateral) => {
+            let mut annotator = TypeAnnotator::new(Some(schema), dialect);
+            annotator.annotate_in_place(&mut lateral.this);
+            if let Some(alias) = &lateral.alias {
+                let aliases: Vec<_> = lateral
+                    .column_aliases
+                    .iter()
+                    .map(crate::expressions::Identifier::new)
+                    .collect();
+                let columns = virtual_output_columns(&lateral.this, alias, &aliases);
+                if !columns.is_empty() {
+                    let _ = schema.add_table(alias, &columns, dialect);
+                }
+            }
+        }
+        Expression::Paren(paren) => annotate_relation_source(&mut paren.this, schema, dialect),
+        _ => {
+            let mut annotator = TypeAnnotator::new(Some(schema), dialect);
+            annotator.annotate_in_place(expression);
+        }
+    }
+}
+
+fn annotate_with(
+    with: &mut Option<crate::expressions::With>,
+    schema: &mut ScopedSchema<'_>,
+    dialect: Option<DialectType>,
+) {
+    if let Some(with) = with {
+        for cte in &mut with.ctes {
+            let columns = annotate_scoped_expression(&mut cte.this, Some(schema), dialect);
+            let columns = apply_column_aliases(columns, &cte.columns);
+            let _ = schema.add_table(&cte.alias.name, &columns, dialect);
+        }
+    }
+}
+
+fn annotate_select(
+    select: &mut crate::expressions::Select,
+    parent: Option<&dyn Schema>,
+    dialect: Option<DialectType>,
+) -> OutputColumns {
+    let mut schema = ScopedSchema::new(parent, dialect);
+    annotate_with(&mut select.with, &mut schema, dialect);
+
+    if let Some(from) = &mut select.from {
+        for source in &mut from.expressions {
+            annotate_relation_source(source, &mut schema, dialect);
+        }
+    }
+    for join in &mut select.joins {
+        annotate_relation_source(&mut join.this, &mut schema, dialect);
+    }
+
+    let mut annotator = TypeAnnotator::new(Some(&schema), dialect);
+    for expression in &mut select.expressions {
+        annotator.annotate_in_place(expression);
+    }
+    query_outputs(&select.expressions)
+}
+
+fn annotate_scoped_expression(
+    expression: &mut Expression,
+    parent: Option<&dyn Schema>,
+    dialect: Option<DialectType>,
+) -> OutputColumns {
+    match expression {
+        Expression::Select(select) => annotate_select(select, parent, dialect),
+        Expression::Subquery(subquery) => {
+            let columns = annotate_scoped_expression(&mut subquery.this, parent, dialect);
+            if let Some((_, first_type)) = columns.first() {
+                subquery.inferred_type = Some(first_type.clone());
+            }
+            columns
+        }
+        Expression::Cte(cte) => annotate_scoped_expression(&mut cte.this, parent, dialect),
+        Expression::Paren(paren) => annotate_scoped_expression(&mut paren.this, parent, dialect),
+        Expression::Union(union) => {
+            let mut schema = ScopedSchema::new(parent, dialect);
+            annotate_with(&mut union.with, &mut schema, dialect);
+            let columns = annotate_scoped_expression(&mut union.left, Some(&schema), dialect);
+            annotate_scoped_expression(&mut union.right, Some(&schema), dialect);
+            columns
+        }
+        Expression::Intersect(intersect) => {
+            let mut schema = ScopedSchema::new(parent, dialect);
+            annotate_with(&mut intersect.with, &mut schema, dialect);
+            let columns = annotate_scoped_expression(&mut intersect.left, Some(&schema), dialect);
+            annotate_scoped_expression(&mut intersect.right, Some(&schema), dialect);
+            columns
+        }
+        Expression::Except(except) => {
+            let mut schema = ScopedSchema::new(parent, dialect);
+            annotate_with(&mut except.with, &mut schema, dialect);
+            let columns = annotate_scoped_expression(&mut except.left, Some(&schema), dialect);
+            annotate_scoped_expression(&mut except.right, Some(&schema), dialect);
+            columns
+        }
+        _ => {
+            let mut annotator = TypeAnnotator::new(parent, dialect);
+            annotator.annotate_in_place(expression);
+            Vec::new()
+        }
+    }
+}
+
 /// Annotate types in-place on the expression tree.
 ///
 /// Walks the AST bottom-up and sets `inferred_type` on each value-producing
@@ -1494,8 +1935,7 @@ pub fn annotate_types(
     schema: Option<&dyn Schema>,
     dialect: Option<DialectType>,
 ) {
-    let mut annotator = TypeAnnotator::new(schema, dialect);
-    annotator.annotate_in_place(expr);
+    annotate_scoped_expression(expr, schema, dialect);
 }
 
 #[cfg(test)]
@@ -2014,6 +2454,7 @@ mod tests {
             with_ordinality: false,
             alias: None,
             offset_alias: None,
+            inferred_type: None,
         }));
         assert_eq!(
             annotator.annotate(&unnest),

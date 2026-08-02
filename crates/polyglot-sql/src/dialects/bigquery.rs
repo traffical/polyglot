@@ -196,6 +196,7 @@ impl DialectImpl for BigQueryDialect {
                     with_ordinality: false,
                     alias: None,
                     offset_alias: None,
+                    inferred_type: None,
                 },
             ))),
 
@@ -207,6 +208,7 @@ impl DialectImpl for BigQueryDialect {
                     with_ordinality: false,
                     alias: None,
                     offset_alias: None,
+                    inferred_type: None,
                 },
             ))),
 
@@ -703,6 +705,7 @@ impl DialectImpl for BigQueryDialect {
                     with_ordinality: false,
                     alias: None,
                     offset_alias: None,
+                    inferred_type: None,
                 }));
                 let aliased_unnest = Expression::Alias(Box::new(Alias {
                     this: unnest,

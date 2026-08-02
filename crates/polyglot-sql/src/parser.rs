@@ -4356,6 +4356,7 @@ impl Parser {
                         with_ordinality: false,
                         alias: None,
                         offset_alias: None,
+                        inferred_type: None,
                     }))
                 } else {
                     Expression::Function(Box::new(Function {
@@ -5315,6 +5316,7 @@ impl Parser {
                             with_ordinality,
                             alias: None,
                             offset_alias,
+                            inferred_type: None,
                         }))
                     } else {
                         // Check for WITH ORDINALITY after any table-valued function
@@ -15585,6 +15587,7 @@ impl Parser {
                 constraints.push(TableConstraint::Index {
                     name: Some(name),
                     columns: Vec::new(),
+                    key_parts: Vec::new(),
                     kind: None,
                     modifiers: ConstraintModifiers::default(),
                     use_key_keyword: false,
@@ -17761,7 +17764,16 @@ impl Parser {
             };
 
             if self.match_token(TokenType::LParen) {
-                let columns = self.parse_index_identifier_list()?;
+                let (columns, key_parts) = if use_key_keyword
+                    && matches!(
+                        self.config.dialect,
+                        Some(crate::dialects::DialectType::MySQL)
+                    ) {
+                    let parts = self.parse_mysql_index_key_parts()?;
+                    Self::split_mysql_table_index_key_parts(parts)
+                } else {
+                    (self.parse_index_identifier_list()?, Vec::new())
+                };
                 self.expect(TokenType::RParen)?;
                 let mut modifiers = self.parse_constraint_modifiers();
                 modifiers.clustered = clustered;
@@ -17770,6 +17782,7 @@ impl Parser {
                     Ok(TableConstraint::Index {
                         name: actual_name.or(name),
                         columns,
+                        key_parts,
                         kind: Some("UNIQUE".to_string()),
                         modifiers,
                         use_key_keyword,
@@ -18099,10 +18112,11 @@ impl Parser {
             None
         };
 
-        // Parse columns (with optional prefix length and DESC)
+        // Parse columns and functional key parts.
         self.expect(TokenType::LParen)?;
-        let columns = self.parse_index_identifier_list()?;
+        let key_parts = self.parse_mysql_index_key_parts()?;
         self.expect(TokenType::RParen)?;
+        let (columns, key_parts) = Self::split_mysql_table_index_key_parts(key_parts);
 
         // Parse optional constraint modifiers (USING after columns, COMMENT, etc.)
         let mut modifiers = self.parse_constraint_modifiers();
@@ -18121,6 +18135,7 @@ impl Parser {
         Ok(TableConstraint::Index {
             name,
             columns,
+            key_parts,
             kind,
             modifiers,
             use_key_keyword,
@@ -18894,16 +18909,32 @@ impl Parser {
         };
 
         // Parse index columns (optional for COLUMNSTORE indexes)
-        let columns = if self.match_token(TokenType::LParen) {
-            let cols = self.parse_index_columns()?;
+        let (columns, key_parts) = if self.match_token(TokenType::LParen) {
+            let parts = if matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::MySQL)
+            ) {
+                self.parse_mysql_index_key_parts()?
+            } else {
+                Vec::new()
+            };
+            let cols = if parts.is_empty() {
+                self.parse_index_columns()?
+            } else {
+                Vec::new()
+            };
             self.expect(TokenType::RParen)?;
-            cols
+            if parts.is_empty() {
+                (cols, Vec::new())
+            } else {
+                Self::split_mysql_create_index_key_parts(parts)
+            }
         } else if clustered
             .as_ref()
             .is_some_and(|c| c.contains("COLUMNSTORE"))
         {
             // COLUMNSTORE indexes don't require a column list
-            Vec::new()
+            (Vec::new(), Vec::new())
         } else if matches!(
             self.config.dialect,
             Some(crate::dialects::DialectType::ClickHouse)
@@ -18943,7 +18974,7 @@ impl Parser {
             self.expect(TokenType::LParen)?;
             let cols = self.parse_index_columns()?;
             self.expect(TokenType::RParen)?;
-            cols
+            (cols, Vec::new())
         };
 
         // PostgreSQL: INCLUDE (col1, col2) clause
@@ -19023,6 +19054,7 @@ impl Parser {
             name,
             table,
             columns,
+            key_parts,
             unique,
             if_not_exists,
             using,
@@ -20036,10 +20068,11 @@ impl Parser {
                     None
                 };
 
-                // Parse columns (with optional prefix length and DESC)
+                // Parse columns and functional key parts.
                 self.expect(TokenType::LParen)?;
-                let columns = self.parse_index_identifier_list()?;
+                let key_parts = self.parse_mysql_index_key_parts()?;
                 self.expect(TokenType::RParen)?;
+                let (columns, key_parts) = Self::split_mysql_table_index_key_parts(key_parts);
 
                 // Parse optional USING BTREE|HASH
                 let modifiers = self.parse_constraint_modifiers();
@@ -20047,6 +20080,7 @@ impl Parser {
                 Ok(AlterTableAction::AddConstraint(TableConstraint::Index {
                     name,
                     columns,
+                    key_parts,
                     kind,
                     modifiers,
                     use_key_keyword,
@@ -46208,6 +46242,125 @@ impl Parser {
 
         Ok(identifiers)
     }
+
+    /// Parse MySQL index key parts.
+    ///
+    /// MySQL distinguishes column key parts (`column[(length)]`) from functional
+    /// key parts (`(expression)`). The surrounding index column list contributes
+    /// the second pair of parentheses in syntax such as `INDEX ((LOWER(name)))`.
+    fn parse_mysql_index_key_parts(&mut self) -> Result<Vec<IndexKeyPart>> {
+        let mut key_parts = Vec::new();
+
+        loop {
+            let (expression, prefix_length) = if self.check(TokenType::LParen) {
+                (self.parse_expression()?, None)
+            } else {
+                let quoted = self.check(TokenType::QuotedIdentifier);
+                let name = self.expect_identifier_or_safe_keyword()?;
+                let trailing_comments = self.previous_trailing_comments().to_vec();
+                let identifier = Identifier {
+                    name,
+                    quoted,
+                    trailing_comments,
+                    span: None,
+                };
+                let prefix_length = if self.match_token(TokenType::LParen) {
+                    if !self.check(TokenType::Number) {
+                        return Err(self.parse_error(
+                            "Expected a numeric prefix length or a parenthesized index expression",
+                        ));
+                    }
+                    let length = self.advance_text();
+                    self.expect(TokenType::RParen)?;
+                    Some(length)
+                } else {
+                    None
+                };
+                (Expression::Identifier(identifier), prefix_length)
+            };
+
+            let desc = self.match_token(TokenType::Desc);
+            let asc = if desc {
+                false
+            } else {
+                self.match_token(TokenType::Asc)
+            };
+            key_parts.push(IndexKeyPart {
+                expression: Box::new(expression),
+                prefix_length,
+                desc,
+                asc,
+                nulls_first: None,
+                opclass: None,
+            });
+
+            if !self.match_token(TokenType::Comma) {
+                break;
+            }
+        }
+
+        Ok(key_parts)
+    }
+
+    /// Keep the established identifier-only AST shape for simple table indexes,
+    /// while retaining an expression-backed representation for functional,
+    /// prefixed, or ordered key parts.
+    fn split_mysql_table_index_key_parts(
+        key_parts: Vec<IndexKeyPart>,
+    ) -> (Vec<Identifier>, Vec<IndexKeyPart>) {
+        let can_use_legacy_columns = key_parts.iter().all(|part| {
+            matches!(part.expression.as_ref(), Expression::Identifier(_))
+                && part.prefix_length.is_none()
+                && !part.desc
+                && !part.asc
+        });
+
+        if can_use_legacy_columns {
+            let columns = key_parts
+                .into_iter()
+                .map(|part| match *part.expression {
+                    Expression::Identifier(identifier) => identifier,
+                    _ => unreachable!("checked above"),
+                })
+                .collect();
+            (columns, Vec::new())
+        } else {
+            (Vec::new(), key_parts)
+        }
+    }
+
+    /// Keep the established `IndexColumn` representation for simple CREATE INDEX
+    /// columns and use expression-backed parts when functional syntax is present.
+    fn split_mysql_create_index_key_parts(
+        key_parts: Vec<IndexKeyPart>,
+    ) -> (Vec<IndexColumn>, Vec<IndexKeyPart>) {
+        let can_use_legacy_columns = key_parts.iter().all(|part| {
+            matches!(part.expression.as_ref(), Expression::Identifier(_))
+                && part.prefix_length.is_none()
+        });
+
+        if can_use_legacy_columns {
+            let columns = key_parts
+                .into_iter()
+                .map(|part| {
+                    let column = match *part.expression {
+                        Expression::Identifier(identifier) => identifier,
+                        _ => unreachable!("checked above"),
+                    };
+                    IndexColumn {
+                        column,
+                        desc: part.desc,
+                        asc: part.asc,
+                        nulls_first: part.nulls_first,
+                        opclass: part.opclass,
+                    }
+                })
+                .collect();
+            (columns, Vec::new())
+        } else {
+            (Vec::new(), key_parts)
+        }
+    }
     // =============================================================================
     // Auto-generated Missing Parser Methods
     // Total: 296 methods
@@ -46471,10 +46624,11 @@ impl Parser {
                 None
             };
 
-            // Parse columns (with optional prefix length and DESC)
+            // Parse columns and functional key parts.
             self.expect(TokenType::LParen)?;
-            let columns = self.parse_index_identifier_list()?;
+            let key_parts = self.parse_mysql_index_key_parts()?;
             self.expect(TokenType::RParen)?;
+            let (columns, key_parts) = Self::split_mysql_table_index_key_parts(key_parts);
 
             // Parse optional USING BTREE|HASH
             let modifiers = self.parse_constraint_modifiers();
@@ -46484,6 +46638,7 @@ impl Parser {
                 actions: vec![AlterTableAction::AddConstraint(TableConstraint::Index {
                     name,
                     columns,
+                    key_parts,
                     kind,
                     modifiers,
                     use_key_keyword,
@@ -60849,6 +61004,7 @@ impl Parser {
             with_ordinality,
             alias,
             offset_alias,
+            inferred_type: None,
         }))))
     }
 

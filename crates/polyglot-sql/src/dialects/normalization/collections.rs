@@ -1111,6 +1111,7 @@ pub(super) fn rewrite(
                                         with_ordinality: false,
                                         alias: Some(Identifier::new(&param_name)),
                                         offset_alias: None,
+                                        inferred_type: None,
                                     }));
                                 let mut sel = crate::expressions::Select::default();
                                 sel.expressions = vec![param_col];
@@ -1137,6 +1138,7 @@ pub(super) fn rewrite(
                                                 with_ordinality: false,
                                                 alias: None,
                                                 offset_alias: None,
+                                                inferred_type: None,
                                             },
                                         )),
                                         alias: Identifier::new("_t0"),
@@ -1244,6 +1246,7 @@ pub(super) fn rewrite(
                                     with_ordinality: false,
                                     alias: None,
                                     offset_alias: None,
+                                    inferred_type: None,
                                 }));
                             let aliased_unnest =
                                 Expression::Alias(Box::new(crate::expressions::Alias {
@@ -2068,6 +2071,7 @@ pub(super) fn rewrite_unnest_expansion(
                 with_ordinality: false,
                 alias: None,
                 offset_alias: None,
+                inferred_type: None,
             }))
         }
         DialectType::Presto | DialectType::Trino => {
@@ -2084,6 +2088,7 @@ pub(super) fn rewrite_unnest_expansion(
                 with_ordinality: false,
                 alias: None,
                 offset_alias: None,
+                inferred_type: None,
             }))
         }
         DialectType::Snowflake => {
@@ -2161,6 +2166,7 @@ pub(super) fn rewrite_unnest_expansion(
                     with_ordinality: true,
                     alias: Some(Identifier::new(actual_col_name.clone())),
                     offset_alias: Some(Identifier::new(info.pos_alias.clone())),
+                    inferred_type: None,
                 };
                 Expression::Unnest(Box::new(unnest))
             }
@@ -2171,6 +2177,7 @@ pub(super) fn rewrite_unnest_expansion(
                     with_ordinality: true,
                     alias: None,
                     offset_alias: None,
+                    inferred_type: None,
                 };
                 Expression::Alias(Box::new(Alias {
                     this: Expression::Unnest(Box::new(unnest)),

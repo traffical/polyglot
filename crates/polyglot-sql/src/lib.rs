@@ -224,9 +224,9 @@ pub use traversal::{
 pub use trie::{new_trie, new_trie_from_keys, Trie, TrieResult};
 #[cfg(feature = "semantic")]
 pub use validation::{
-    mapping_schema_from_validation_schema, validate_with_schema, SchemaColumn,
-    SchemaColumnReference, SchemaForeignKey, SchemaTable, SchemaTableReference,
-    SchemaValidationOptions, ValidationSchema,
+    mapping_schema_from_validation_schema, mapping_schema_from_validation_schema_with_dialect,
+    validate_with_schema, SchemaColumn, SchemaColumnReference, SchemaForeignKey, SchemaTable,
+    SchemaTableReference, SchemaValidationOptions, ValidationSchema,
 };
 
 #[cfg(feature = "generate")]

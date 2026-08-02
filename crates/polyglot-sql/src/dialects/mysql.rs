@@ -1404,6 +1404,56 @@ END;";
         assert!(output.contains("INSERT INTO employees (salary) VALUES (p_salary)"));
     }
 
+    #[test]
+    fn test_mysql_functional_index_key_parts() {
+        let dialect = Dialect::get(DialectType::MySQL);
+        let issue_sql = "CREATE TABLE `test_report` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `batch_no` varchar(64) NOT NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_clean_batch` ((trim(leading _utf8mb4'0' from `batch_no`)))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+        let ast = dialect.parse(issue_sql).expect("Issue #371 should parse");
+        let output = dialect.generate(&ast[0]).expect("Generate failed");
+        assert!(
+            output.contains("INDEX idx_clean_batch ((TRIM(LEADING _utf8mb4 '0' FROM `batch_no`)))"),
+            "Unexpected output: {output}"
+        );
+
+        for (sql, expected) in [
+            (
+                "CREATE TABLE t (c VARCHAR(20), d INT, KEY idx (d, (LOWER(c)) DESC))",
+                "INDEX idx (d, (LOWER(c)) DESC)",
+            ),
+            (
+                "CREATE TABLE t (c VARCHAR(20), UNIQUE INDEX idx ((LOWER(c))))",
+                "UNIQUE idx ((LOWER(c)))",
+            ),
+            (
+                "ALTER TABLE t ADD INDEX idx ((LOWER(c)))",
+                "ADD INDEX idx ((LOWER(c)))",
+            ),
+            (
+                "CREATE INDEX idx ON t ((LOWER(c)))",
+                "CREATE INDEX idx ON t((LOWER(c)))",
+            ),
+            (
+                "CREATE INDEX idx ON t (c(10), d DESC)",
+                "CREATE INDEX idx ON t(c(10), d DESC)",
+            ),
+        ] {
+            let ast = dialect
+                .parse(sql)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            let output = dialect.generate(&ast[0]).expect("Generate failed");
+            assert!(
+                output.contains(expected),
+                "SQL: {sql}\nExpected: {expected}\nActual: {output}"
+            );
+            assert!(!output.contains('?'), "Expression was lost: {output}");
+        }
+    }
+
     fn mysql_identity(sql: &str, expected: &str) {
         let dialect = Dialect::get(DialectType::MySQL);
         let ast = dialect.parse(sql).expect("Parse failed");

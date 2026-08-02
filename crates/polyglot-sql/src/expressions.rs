@@ -1324,6 +1324,7 @@ impl Expression {
             Expression::Case(c) => c.inferred_type.as_ref(),
             Expression::Subquery(s) => s.inferred_type.as_ref(),
             Expression::Alias(a) => a.inferred_type.as_ref(),
+            Expression::Unnest(u) => u.inferred_type.as_ref(),
             Expression::IfFunc(f) => f.inferred_type.as_ref(),
             Expression::Nvl2(f) => f.inferred_type.as_ref(),
             Expression::Count(f) => f.inferred_type.as_ref(),
@@ -1551,6 +1552,7 @@ impl Expression {
             Expression::Case(c) => c.inferred_type = Some(dt),
             Expression::Subquery(s) => s.inferred_type = Some(dt),
             Expression::Alias(a) => a.inferred_type = Some(dt),
+            Expression::Unnest(u) => u.inferred_type = Some(dt),
             Expression::IfFunc(f) => f.inferred_type = Some(dt),
             Expression::Nvl2(f) => f.inferred_type = Some(dt),
             Expression::Count(f) => f.inferred_type = Some(dt),
@@ -7046,6 +7048,10 @@ pub struct UnnestFunc {
     /// BigQuery: offset alias for WITH OFFSET AS <name>
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset_alias: Option<Identifier>,
+    /// Inferred type of the first UNNEST output column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ast(skip)]
+    pub inferred_type: Option<DataType>,
 }
 
 /// ARRAY_FILTER function (with lambda)
@@ -8083,6 +8089,10 @@ pub enum TableConstraint {
     Index {
         name: Option<Identifier>,
         columns: Vec<Identifier>,
+        /// Expression-capable index key parts. This is used when an index contains
+        /// functional key parts that cannot be represented by `columns`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        key_parts: Vec<IndexKeyPart>,
         /// Index kind: UNIQUE, FULLTEXT, SPATIAL, etc.
         #[serde(default)]
         kind: Option<String>,
@@ -8592,6 +8602,10 @@ pub struct CreateIndex {
     pub name: Identifier,
     pub table: TableRef,
     pub columns: Vec<IndexColumn>,
+    /// Expression-capable index key parts. This is used when an index contains
+    /// functional key parts that cannot be represented by `columns`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_parts: Vec<IndexKeyPart>,
     pub unique: bool,
     pub if_not_exists: bool,
     pub using: Option<String>,
@@ -8621,6 +8635,7 @@ impl CreateIndex {
             name: Identifier::new(name),
             table: TableRef::new(table),
             columns: Vec::new(),
+            key_parts: Vec::new(),
             unique: false,
             if_not_exists: false,
             using: None,
@@ -8645,6 +8660,24 @@ pub struct IndexColumn {
     pub asc: bool,
     pub nulls_first: Option<bool>,
     /// PostgreSQL operator class (e.g., varchar_pattern_ops, public.gin_trgm_ops)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opclass: Option<String>,
+}
+
+/// An expression-capable index key part.
+#[derive(polyglot_sql_ast_derive::AstNode, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "bindings", derive(TS))]
+pub struct IndexKeyPart {
+    pub expression: Box<Expression>,
+    /// MySQL column prefix length, for example the `16` in `name(16)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_length: Option<String>,
+    pub desc: bool,
+    /// Explicit ASC keyword was present.
+    #[serde(default)]
+    pub asc: bool,
+    pub nulls_first: Option<bool>,
+    /// PostgreSQL operator class (e.g., varchar_pattern_ops, public.gin_trgm_ops).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opclass: Option<String>,
 }

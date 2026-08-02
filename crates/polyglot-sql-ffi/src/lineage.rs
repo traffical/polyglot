@@ -4,7 +4,7 @@ use crate::helpers::{
 };
 use crate::types::{PolyglotResult, STATUS_PARSE_ERROR, STATUS_SERIALIZATION_ERROR};
 use polyglot_sql::lineage::{get_source_tables, lineage as compute_lineage};
-use polyglot_sql::mapping_schema_from_validation_schema;
+use polyglot_sql::mapping_schema_from_validation_schema_with_dialect;
 use std::os::raw::c_char;
 
 /// Trace column lineage in a SQL statement.
@@ -171,7 +171,10 @@ fn lineage_with_schema_impl(
                 );
             }
         };
-    let mapping_schema = mapping_schema_from_validation_schema(&validation_schema);
+    let mapping_schema = mapping_schema_from_validation_schema_with_dialect(
+        &validation_schema,
+        dialect.dialect_type(),
+    );
 
     match polyglot_sql::lineage::lineage_with_schema(
         &column_name,

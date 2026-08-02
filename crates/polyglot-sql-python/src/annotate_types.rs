@@ -30,6 +30,9 @@ pub fn annotate_types(
 ) -> PyResult<Py<PyAny>> {
     resolve_dialect(dialect)?;
 
+    let dialect_type = polyglot_sql::dialects::Dialect::get_by_name(dialect)
+        .expect("dialect existence checked")
+        .dialect_type();
     let mapping_schema = if let Some(schema_obj) = schema {
         let validation_schema: polyglot_sql::ValidationSchema =
             depythonize(schema_obj).map_err(|err| {
@@ -37,9 +40,12 @@ pub fn annotate_types(
                     "Invalid schema object (expected ValidationSchema shape): {err}"
                 ))
             })?;
-        Some(polyglot_sql::mapping_schema_from_validation_schema(
-            &validation_schema,
-        ))
+        Some(
+            polyglot_sql::mapping_schema_from_validation_schema_with_dialect(
+                &validation_schema,
+                dialect_type,
+            ),
+        )
     } else {
         None
     };

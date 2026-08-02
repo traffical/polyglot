@@ -101,6 +101,7 @@ impl DialectImpl for TrinoDialect {
                     with_ordinality: false,
                     alias: None,
                     offset_alias: None,
+                    inferred_type: None,
                 },
             ))),
 
@@ -112,6 +113,7 @@ impl DialectImpl for TrinoDialect {
                     with_ordinality: false,
                     alias: None,
                     offset_alias: None,
+                    inferred_type: None,
                 },
             ))),
 

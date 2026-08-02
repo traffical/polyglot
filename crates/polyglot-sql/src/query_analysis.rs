@@ -14,8 +14,8 @@ use crate::optimizer::qualify_columns::{qualify_columns, QualifyColumnsOptions};
 use crate::schema::{MappingSchema, Schema};
 use crate::scope::{build_scope, Scope, SourceInfo, SourceKind};
 use crate::traversal::{contains_aggregate, ExpressionWalk};
-use crate::validation::{mapping_schema_from_validation_schema, ValidationSchema};
-use crate::{parse_data_type, parse_one, Error, Result};
+use crate::validation::{mapping_schema_from_validation_schema_with_dialect, ValidationSchema};
+use crate::{parse_one, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -194,30 +194,14 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
             .map_err(|e| Error::internal(format!("query analysis qualification failed: {e}")))?;
     }
 
-    let annotation_schema = mapping_schema.as_ref().map(|schema| {
-        let mut alias_schema = schema.clone();
-        add_scope_aliases_to_schema(
-            &build_scope(&expression),
-            schema,
-            &mut alias_schema,
-            options.dialect,
-        );
-        alias_schema
-    });
-
     annotate_types(
         &mut expression,
-        annotation_schema
-            .as_ref()
-            .map(|schema| schema as &dyn Schema),
+        mapping_schema.as_ref().map(|schema| schema as &dyn Schema),
         Some(options.dialect),
     );
     crate::lineage::expand_cte_stars(
         &mut expression,
-        annotation_schema
-            .as_ref()
-            .or(mapping_schema.as_ref())
-            .map(|schema| schema as &dyn Schema),
+        mapping_schema.as_ref().map(|schema| schema as &dyn Schema),
     );
 
     let scope = build_scope(&expression);
@@ -249,36 +233,7 @@ pub fn analyze_query(sql: &str, options: AnalyzeQueryOptions) -> Result<QueryAna
 }
 
 fn analysis_mapping_schema(schema: &ValidationSchema, dialect: DialectType) -> MappingSchema {
-    let broad_schema = mapping_schema_from_validation_schema(schema);
-    let mut mapping_schema = MappingSchema::with_dialect(dialect);
-
-    for table in &schema.tables {
-        let table_names = validation_table_names(table);
-        if table_names.is_empty() {
-            continue;
-        }
-
-        let fallback_table = table_names[0].as_str();
-        let columns: Vec<(String, DataType)> = table
-            .columns
-            .iter()
-            .map(|column| {
-                let data_type = parse_analysis_data_type(&column.data_type, dialect)
-                    .unwrap_or_else(|| {
-                        broad_schema
-                            .get_column_type(fallback_table, &column.name)
-                            .unwrap_or(DataType::Unknown)
-                    });
-                (column.name.to_ascii_lowercase(), data_type)
-            })
-            .collect();
-
-        for table_name in table_names {
-            let _ = mapping_schema.add_table(&table_name, &columns, Some(dialect));
-        }
-    }
-
-    mapping_schema
+    mapping_schema_from_validation_schema_with_dialect(schema, dialect)
 }
 
 fn validation_table_names(table: &crate::validation::SchemaTable) -> Vec<String> {
@@ -299,48 +254,6 @@ fn validation_table_names(table: &crate::validation::SchemaTable) -> Vec<String>
     names.sort();
     names.dedup();
     names
-}
-
-fn parse_analysis_data_type(data_type: &str, dialect: DialectType) -> Option<DataType> {
-    let trimmed = data_type.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    parse_data_type(trimmed, dialect).ok()
-}
-
-fn add_scope_aliases_to_schema(
-    scope: &Scope,
-    source_schema: &MappingSchema,
-    target_schema: &mut MappingSchema,
-    dialect: DialectType,
-) {
-    for child_scope in scope.traverse() {
-        for (source_name, source) in &child_scope.sources {
-            if source.kind != SourceKind::Table {
-                continue;
-            }
-            if let Some(table_name) = source_table_name(source) {
-                if source_name == &table_name {
-                    continue;
-                }
-                if let Ok(column_names) = source_schema.column_names(&table_name) {
-                    let columns: Vec<(String, DataType)> = column_names
-                        .iter()
-                        .map(|column| {
-                            (
-                                column.clone(),
-                                source_schema
-                                    .get_column_type(&table_name, column)
-                                    .unwrap_or(DataType::Unknown),
-                            )
-                        })
-                        .collect();
-                    let _ = target_schema.add_table(source_name, &columns, Some(dialect));
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

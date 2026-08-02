@@ -6,7 +6,7 @@
 //!
 
 use crate::dialects::DialectType;
-use crate::expressions::{Expression, Identifier, JoinKind, NamedWindow, Select, With};
+use crate::expressions::{DataType, Expression, Identifier, JoinKind, NamedWindow, Select, With};
 #[cfg(feature = "generate")]
 use crate::generator::Generator;
 use crate::optimizer::annotate_types::annotate_types;
@@ -2106,6 +2106,54 @@ fn virtual_source_output_columns(
     }
 }
 
+fn unnest_output_types(unnest: &crate::expressions::UnnestFunc) -> Vec<DataType> {
+    let element_type = |expression: &Expression| match expression.inferred_type() {
+        Some(DataType::Array { element_type, .. }) => (**element_type).clone(),
+        _ => DataType::Unknown,
+    };
+
+    let mut types = vec![unnest
+        .inferred_type
+        .clone()
+        .unwrap_or_else(|| element_type(&unnest.this))];
+    types.extend(unnest.expressions.iter().map(element_type));
+    if unnest.with_ordinality || unnest.offset_alias.is_some() {
+        types.push(DataType::BigInt { length: None });
+    }
+    types
+}
+
+fn virtual_source_column_type(source_info: &ScopeSourceInfo, column: &str) -> Option<DataType> {
+    let find_type = |names: Vec<String>, types: Vec<DataType>| {
+        names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(column))
+            .and_then(|index| types.get(index).cloned())
+    };
+
+    match &source_info.expression {
+        Expression::Unnest(unnest) => find_type(
+            unnest_output_columns(unnest).collect(),
+            unnest_output_types(unnest),
+        ),
+        Expression::Alias(alias) => match &alias.this {
+            Expression::Unnest(unnest) => find_type(
+                alias_output_columns(alias).collect(),
+                unnest_output_types(unnest),
+            ),
+            _ => None,
+        },
+        Expression::Lateral(lateral) => match lateral.this.as_ref() {
+            Expression::Unnest(unnest) => find_type(
+                lateral_output_columns(lateral).collect(),
+                unnest_output_types(unnest),
+            ),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn unnest_output_columns(
     unnest: &crate::expressions::UnnestFunc,
 ) -> impl Iterator<Item = String> + '_ {
@@ -2774,6 +2822,9 @@ fn make_table_column_node_from_source(
     source_info: &ScopeSourceInfo,
 ) -> LineageNode {
     let lineage_name = source_info.lineage_name.as_deref().unwrap_or(source_key);
+    let inferred_type = (source_info.kind == SourceKind::Virtual)
+        .then(|| virtual_source_column_type(source_info, column))
+        .flatten();
     let mut node = LineageNode::new(
         format!("{}.{}", lineage_name, column),
         Expression::Column(Box::new(crate::expressions::Column {
@@ -2784,7 +2835,7 @@ fn make_table_column_node_from_source(
             join_mark: false,
             trailing_comments: vec![],
             span: None,
-            inferred_type: None,
+            inferred_type,
         })),
         source_info.expression.clone(),
     );
@@ -4393,6 +4444,52 @@ FROM t JOIN UNNEST(t.items) AS item ON TRUE
             assert_eq!(real_child.name, "t.items");
             assert_eq!(real_child.source_kind, SourceKind::Table);
         }
+    }
+
+    #[test]
+    fn test_lineage_with_schema_propagates_unnest_element_type() {
+        let expr = parse_dialect(
+            "SELECT u.tag FROM events AS e, UNNEST(e.tags) AS u(tag)",
+            DialectType::DuckDB,
+        );
+        let mut schema = MappingSchema::with_dialect(DialectType::DuckDB);
+        schema
+            .add_table(
+                "events",
+                &[(
+                    "tags".into(),
+                    DataType::Array {
+                        element_type: Box::new(DataType::VarChar {
+                            length: None,
+                            parenthesized_length: false,
+                        }),
+                        dimension: None,
+                    },
+                )],
+                None,
+            )
+            .expect("schema setup");
+
+        let node = lineage_with_schema(
+            "tag",
+            &expr,
+            Some(&schema),
+            Some(DialectType::DuckDB),
+            false,
+        )
+        .expect("lineage_with_schema");
+        let expected = DataType::VarChar {
+            length: None,
+            parenthesized_length: false,
+        };
+
+        assert_eq!(node.expression.inferred_type(), Some(&expected));
+        let virtual_child = node
+            .downstream
+            .iter()
+            .find(|child| child.source_kind == SourceKind::Virtual)
+            .expect("virtual UNNEST output");
+        assert_eq!(virtual_child.expression.inferred_type(), Some(&expected));
     }
 
     #[test]

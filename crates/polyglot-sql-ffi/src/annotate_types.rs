@@ -59,7 +59,12 @@ fn annotate_types_impl(
             unsafe { required_arg(schema_json, "schema_json") }.unwrap_or_default();
         if !schema_str.is_empty() {
             match serde_json::from_str::<polyglot_sql::ValidationSchema>(&schema_str) {
-                Ok(vs) => Some(polyglot_sql::mapping_schema_from_validation_schema(&vs)),
+                Ok(vs) => Some(
+                    polyglot_sql::mapping_schema_from_validation_schema_with_dialect(
+                        &vs,
+                        dialect.dialect_type(),
+                    ),
+                ),
                 Err(error) => {
                     return err_result(
                         STATUS_SERIALIZATION_ERROR,

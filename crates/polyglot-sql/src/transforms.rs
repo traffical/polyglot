@@ -675,6 +675,7 @@ fn extract_unnest_info(expr: Expression) -> (Option<Identifier>, Vec<Identifier>
                         with_ordinality: false,
                         alias: None,
                         offset_alias: None,
+                        inferred_type: None,
                     },
                 )
             }
@@ -692,6 +693,7 @@ fn extract_unnest_info(expr: Expression) -> (Option<Identifier>, Vec<Identifier>
                 with_ordinality: false,
                 alias: None,
                 offset_alias: None,
+                inferred_type: None,
             },
         ),
     }
@@ -706,6 +708,7 @@ pub fn explode_to_unnest(expr: Expression) -> Result<Expression> {
             with_ordinality: false,
             alias: None,
             offset_alias: None,
+            inferred_type: None,
         }))),
         _ => Ok(expr),
     }
@@ -3518,6 +3521,7 @@ pub fn unnest_generate_series(expr: Expression) -> Result<Expression> {
                     with_ordinality: false,
                     alias: None,
                     offset_alias: None,
+                    inferred_type: None,
                 }));
 
                 // If there's an alias, wrap in alias
@@ -3542,6 +3546,7 @@ pub fn unnest_generate_series(expr: Expression) -> Result<Expression> {
                 with_ordinality: false,
                 alias: None,
                 offset_alias: None,
+                inferred_type: None,
             }));
             Ok(unnest)
         }
@@ -4316,6 +4321,7 @@ pub fn expand_posexplode_duckdb(expr: Expression) -> Result<Expression> {
                                 with_ordinality: false,
                                 alias: None,
                                 offset_alias: None,
+                                inferred_type: None,
                             }));
                             let col_alias = Expression::Alias(Box::new(Alias {
                                 this: unnest,
@@ -4373,6 +4379,7 @@ pub fn expand_posexplode_duckdb(expr: Expression) -> Result<Expression> {
                             with_ordinality: false,
                             alias: None,
                             offset_alias: None,
+                            inferred_type: None,
                         }));
                         let col_alias = Expression::Alias(Box::new(Alias {
                             this: unnest,
@@ -4464,6 +4471,7 @@ fn expand_posexplode_in_from_duckdb(from: &mut From) -> Result<()> {
                         with_ordinality: false,
                         alias: None,
                         offset_alias: None,
+                        inferred_type: None,
                     }));
                     let col_alias = Expression::Alias(Box::new(Alias {
                         this: unnest,
@@ -4536,6 +4544,7 @@ fn expand_posexplode_in_from_duckdb(from: &mut From) -> Result<()> {
                     with_ordinality: false,
                     alias: None,
                     offset_alias: None,
+                    inferred_type: None,
                 }));
                 let col_alias = Expression::Alias(Box::new(Alias {
                     this: unnest,
@@ -6057,6 +6066,7 @@ mod tests {
             with_ordinality: false,
             alias: None,
             offset_alias: None,
+            inferred_type: None,
         }));
 
         let result = unnest_to_explode(unnest).unwrap();

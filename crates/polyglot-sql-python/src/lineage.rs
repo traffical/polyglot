@@ -40,7 +40,13 @@ pub fn lineage_with_schema(
             "Invalid schema object (expected ValidationSchema shape): {err}"
         ))
     })?;
-    let mapping_schema = polyglot_sql::mapping_schema_from_validation_schema(&validation_schema);
+    let dialect_type = polyglot_sql::dialects::Dialect::get_by_name(dialect)
+        .expect("dialect existence checked")
+        .dialect_type();
+    let mapping_schema = polyglot_sql::mapping_schema_from_validation_schema_with_dialect(
+        &validation_schema,
+        dialect_type,
+    );
 
     let node = py.detach(|| {
         let dialect_impl = polyglot_sql::dialects::Dialect::get_by_name(dialect)

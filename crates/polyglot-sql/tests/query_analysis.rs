@@ -737,6 +737,83 @@ fn analyze_query_resolves_unnest_virtual_output_aliases_with_schema() {
 }
 
 #[test]
+fn analyze_query_propagates_unnest_element_types_through_query_scopes() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [{
+            "name": "events",
+            "columns": [{"name": "tags", "type": "VARCHAR[]"}]
+        }]
+    }))
+    .unwrap();
+
+    for sql in [
+        "SELECT UNNEST(e.tags) AS tag FROM events AS e",
+        "SELECT u.tag FROM events AS e, UNNEST(e.tags) AS u(tag)",
+        "WITH exploded AS (SELECT u.tag AS tag FROM events AS e, \
+         UNNEST(e.tags) AS u(tag)) SELECT tag FROM exploded",
+        "SELECT d.tag FROM (SELECT u.tag AS tag FROM events AS e, \
+         UNNEST(e.tags) AS u(tag)) AS d",
+    ] {
+        let analysis = analyze_query(
+            sql,
+            AnalyzeQueryOptions {
+                dialect: DialectType::DuckDB,
+                schema: Some(schema.clone()),
+            },
+        )
+        .unwrap_or_else(|error| panic!("analyze_query failed for {sql:?}: {error}"));
+
+        assert_eq!(
+            analysis.projections[0].type_hint.as_deref(),
+            Some("TEXT"),
+            "unexpected output type for {sql:?}"
+        );
+    }
+}
+
+#[test]
+fn analyze_query_keeps_reused_unnest_alias_types_isolated_between_ctes() {
+    let schema: ValidationSchema = serde_json::from_value(json!({
+        "tables": [
+            {
+                "name": "integer_events",
+                "columns": [{"name": "items", "type": "INT[]"}]
+            },
+            {
+                "name": "text_events",
+                "columns": [{"name": "items", "type": "VARCHAR[]"}]
+            }
+        ]
+    }))
+    .unwrap();
+
+    for sql in [
+        "WITH ints AS (SELECT u.item FROM integer_events AS e, \
+         UNNEST(e.items) AS u(item)), \
+         texts AS (SELECT u.item FROM text_events AS e, \
+         UNNEST(e.items) AS u(item)) \
+         SELECT ints.item AS int_item, texts.item AS text_item FROM ints CROSS JOIN texts",
+        "WITH texts AS (SELECT u.item FROM text_events AS e, \
+         UNNEST(e.items) AS u(item)), \
+         ints AS (SELECT u.item FROM integer_events AS e, \
+         UNNEST(e.items) AS u(item)) \
+         SELECT ints.item AS int_item, texts.item AS text_item FROM ints CROSS JOIN texts",
+    ] {
+        let analysis = analyze_query(
+            sql,
+            AnalyzeQueryOptions {
+                dialect: DialectType::DuckDB,
+                schema: Some(schema.clone()),
+            },
+        )
+        .unwrap_or_else(|error| panic!("analyze_query failed for {sql:?}: {error}"));
+
+        assert_eq!(analysis.projections[0].type_hint.as_deref(), Some("INT"));
+        assert_eq!(analysis.projections[1].type_hint.as_deref(), Some("TEXT"));
+    }
+}
+
+#[test]
 fn analyze_query_tolerates_partial_schema_for_unknown_columns() {
     let analysis = analyze_query(
         "SELECT order_id, amount FROM t",

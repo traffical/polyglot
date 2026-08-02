@@ -21,6 +21,15 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   structured object-privilege grants are preserved.
 
 ### Fixed
+- Schema-aware type annotation and lineage now propagate scalar element types
+  from select-list and table-valued `UNNEST` expressions through CTEs and
+  derived tables. Virtual aliases remain scope-local, so reused aliases in
+  sibling CTEs cannot overwrite one another's inferred types.
+- MySQL 8 functional index key parts now parse and generate structurally in
+  table definitions, `ALTER TABLE ... ADD INDEX`, and standalone `CREATE
+  INDEX` statements. Mixed column and expression parts, prefix lengths,
+  `ASC`/`DESC`, unique indexes, and character-set introducers are preserved
+  instead of rejecting the DDL or replacing expressions with `?`.
 - PostgreSQL row-value equality against scalar subqueries now lowers to
   T-SQL/Fabric scalar `CASE` subqueries with correct true, false, and null
   behavior. Zero- and multi-row cardinality, query modifiers, explicit aliases,

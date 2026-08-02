@@ -614,6 +614,52 @@ pub fn mapping_schema_from_validation_schema(schema: &ValidationSchema) -> Mappi
     build_resolver_schema(schema)
 }
 
+/// Build a dialect-aware `MappingSchema` while preserving nested types such
+/// as ARRAY, MAP, and STRUCT. If a type spelling is not understood by the
+/// selected dialect, this falls back to the validation resolver's broad type
+/// family so existing best-effort behavior is retained.
+pub fn mapping_schema_from_validation_schema_with_dialect(
+    schema: &ValidationSchema,
+    dialect: DialectType,
+) -> MappingSchema {
+    let broad_schema = build_resolver_schema(schema);
+    let dialect_impl = Dialect::get(dialect);
+    let mut mapping = MappingSchema::with_dialect(dialect);
+
+    for table in &schema.tables {
+        let fallback_table = lower(&table.name);
+        let columns: Vec<(String, DataType)> = table
+            .columns
+            .iter()
+            .map(|column| {
+                let data_type = dialect_impl
+                    .parse_data_type(column.data_type.trim())
+                    .unwrap_or_else(|_| {
+                        broad_schema
+                            .get_column_type(&fallback_table, &column.name)
+                            .unwrap_or(DataType::Unknown)
+                    });
+                (column.name.clone(), data_type)
+            })
+            .collect();
+
+        let mut table_names = vec![table.name.clone()];
+        if let Some(table_schema) = &table.schema {
+            table_names.push(format!("{}.{}", table_schema, table.name));
+        }
+        table_names.extend(table.aliases.iter().cloned());
+
+        let mut seen = HashSet::new();
+        for table_name in table_names {
+            if seen.insert(lower(&table_name)) {
+                let _ = mapping.add_table(&table_name, &columns, Some(dialect));
+            }
+        }
+    }
+
+    mapping
+}
+
 fn collect_cte_aliases(expr: &Expression) -> HashSet<String> {
     let mut aliases = HashSet::new();
 

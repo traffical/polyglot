@@ -638,6 +638,7 @@ pub(super) fn normalize(
                             with_ordinality: false,
                             alias: None,
                             offset_alias: None,
+                            inferred_type: None,
                         }))
                     };
 
@@ -776,6 +777,7 @@ pub(super) fn normalize(
                                                     with_ordinality: false,
                                                     alias: None,
                                                     offset_alias: None,
+                                                    inferred_type: None,
                                                 },
                                             ));
                                             let join_this = if let Some(ref alias) = t.alias {

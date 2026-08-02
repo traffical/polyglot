@@ -12,7 +12,7 @@ use polyglot_sql::{
     expressions::{BooleanLiteral, DataType, Expression},
     format as core_format, format_with_options as core_format_with_options, get_all_tables,
     lineage::{self, LineageNode},
-    mapping_schema_from_validation_schema,
+    mapping_schema_from_validation_schema_with_dialect,
     openlineage::{
         openlineage_column_lineage as core_openlineage_column_lineage,
         openlineage_job_event as core_openlineage_job_event,
@@ -1402,7 +1402,8 @@ fn lineage_with_schema_internal(
         }
     };
 
-    let mapping_schema = mapping_schema_from_validation_schema(&validation_schema);
+    let mapping_schema =
+        mapping_schema_from_validation_schema_with_dialect(&validation_schema, dialect_type);
     let dialect_opt = if dialect_type == DialectType::Generic {
         None
     } else {
@@ -1728,7 +1729,10 @@ fn annotate_types_internal(sql: &str, dialect: &str, schema_json: &str) -> Parse
     // Parse schema if provided
     let schema = if !schema_json.is_empty() {
         match serde_json::from_str::<CoreValidationSchema>(schema_json) {
-            Ok(vs) => Some(mapping_schema_from_validation_schema(&vs)),
+            Ok(vs) => Some(mapping_schema_from_validation_schema_with_dialect(
+                &vs,
+                dialect_type,
+            )),
             Err(_) => None,
         }
     } else {

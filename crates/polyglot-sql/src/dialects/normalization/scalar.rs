@@ -9857,6 +9857,7 @@ pub(super) fn rewrite(
                                             with_ordinality: false,
                                             alias: None,
                                             offset_alias: None,
+                                            inferred_type: None,
                                         },
                                     ));
                                     let aliased_unnest =

@@ -10,7 +10,7 @@ use crate::lineage::{self, LineageNode};
 use crate::schema::Schema;
 use crate::scope::SourceKind;
 use crate::traversal::ExpressionWalk;
-use crate::{mapping_schema_from_validation_schema, Error, Result, ValidationSchema};
+use crate::{mapping_schema_from_validation_schema_with_dialect, Error, Result, ValidationSchema};
 use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -193,7 +193,7 @@ pub fn openlineage_column_lineage(
     let schema_mapping = options
         .schema
         .as_ref()
-        .map(mapping_schema_from_validation_schema);
+        .map(|schema| mapping_schema_from_validation_schema_with_dialect(schema, options.dialect));
     let dialect = Dialect::get(options.dialect);
     let mut expressions = dialect.parse(sql)?;
     if expressions.len() != 1 {
