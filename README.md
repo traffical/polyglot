@@ -390,41 +390,47 @@ Optional dialect function catalogs are provided via `crates/polyglot-sql-functio
 
 ## Testing
 
-Polyglot currently runs **10,220 SQLGlot fixture cases** plus additional project-specific suites. All strict pass/fail suites are at **100%** in the latest verification run.
+Polyglot currently runs **11,333 SQLGlot fixture cases** plus additional project-specific suites. All strict pass/fail suites are at **100%** in the latest verification run.
 
 | Category | Count | Pass Rate |
 |----------|------:|:---------:|
-| SQLGlot generic identity | 956 | 100% |
-| SQLGlot dialect identity | 3,554 | 100% |
-| SQLGlot transpilation | 5,513 | 100% |
-| SQLGlot transpile (generic) | 145 | 100% |
-| SQLGlot parser | 29 | 100% |
+| SQLGlot generic identity | 977 | 100% |
+| SQLGlot dialect identity | 4,086 | 100% |
+| SQLGlot transpilation | 6,061 | 100% |
+| SQLGlot transpile (generic) | 154 | 100% |
+| SQLGlot parser | 32 | 100% |
 | SQLGlot pretty-print | 23 | 100% |
-| Lib unit tests | 835 | 100% |
+| Lib unit tests (non-ignored) | 1,141 | 100% |
 | Custom dialect identity | 276 | 100% |
 | Custom dialect transpilation | 347 | 100% |
-| ClickHouse parser corpus (non-skipped) | 7,047 | 100% |
-| FFI integration tests | 20 | 100% |
-| Python bindings tests (`make test-python`) | 69 | 100% |
-| **Total (strict Rust/FFI pass/fail case count)** | **18,745** | **100%** |
+| ClickHouse parser corpus (non-skipped) | 9,417 | 100% |
+| ClickHouse normalized round trips (in-scope) | 121,020 | 100% |
+| FFI integration tests | 66 | 100% |
+| Python bindings tests (non-skipped) | 169 | 100% |
+| **Total (strict Rust/FFI pass/fail case count)** | **143,600** | **100%** |
+
+One Rust unit test is ignored, one Python compatibility test is skipped, and 172 out-of-scope KQL/non-SQL ClickHouse fixtures are excluded from the strict counts.
 
 ```bash
 # Setup fixtures (required once)
 make setup-fixtures
 
 # Run all tests
-make test-rust-all          # All SQLGlot fixture suites
-make test-rust-lib          # Lib unit tests (835)
-make test-rust-verify       # Full strict verification suite
-make test-ffi               # FFI crate integration tests
+make test-rust-all          # All 11,333 SQLGlot fixture cases
+make test-rust-lib          # 1,141 active lib unit tests (1 ignored)
+make test-rust-verify       # All 143,600 strict Rust/FFI cases
+make test-ffi               # 66 FFI integration tests
+make test-python            # 169 active Python tests (1 skipped)
 
 # Individual test suites
-make test-rust-identity     # 956 generic identity cases
-make test-rust-dialect      # 3,554 dialect identity cases
-make test-rust-transpile    # 5,513 transpilation cases
-make test-rust-transpile-generic # 145 generic transpile cases
-make test-rust-parser       # 29 parser cases
+make test-rust-identity     # 977 generic identity cases
+make test-rust-dialect      # 4,086 dialect identity cases
+make test-rust-transpile    # 6,061 transpilation cases
+make test-rust-transpile-generic # 154 generic transpile cases
+make test-rust-parser       # 32 parser cases
 make test-rust-pretty       # 23 pretty-print cases
+make test-rust-clickhouse-parser   # 9,417 ClickHouse files
+make test-rust-clickhouse-coverage # 121,020 normalized round trips
 
 # Additional tests
 make test-rust-roundtrip    # Organized roundtrip unit tests
@@ -475,11 +481,11 @@ cargo +nightly fuzz run fuzz_transpile
 | `make build-python` | Build Python wheels with maturin (`python_release` profile) |
 | `make test-ffi` | Run FFI integration tests |
 | `make test-rust` | Run SQLGlot-named Rust tests in `polyglot-sql` |
-| `make test-rust-all` | Run all 10,220 SQLGlot fixture cases |
-| `make test-rust-lib` | Run 835 lib unit tests |
+| `make test-rust-all` | Run all 11,333 SQLGlot fixture cases |
+| `make test-rust-lib` | Run 1,141 active lib unit tests (1 ignored) |
 | `make test-rust-verify` | Full verification suite |
 | `make test-rust-clickhouse-parser` | Run strict ClickHouse parser suite |
-| `make test-rust-clickhouse-coverage` | Run ClickHouse coverage suite (report-only) |
+| `make test-rust-clickhouse-coverage` | Run the strict ClickHouse normalized round-trip suite |
 | `make test-compare` | Compare against Python sqlglot |
 | `make bench-compare` | Performance comparison |
 | `make bench-rust-parsing-report` | Run `rust_parsing` bench and generate Markdown report |
@@ -499,32 +505,6 @@ cargo +nightly fuzz run fuzz_transpile
 | `make playground-deploy` | Deploy playground to Cloudflare Pages |
 | `make clean` | Remove all build artifacts |
 
-## Rust Parsing Markdown Report
-
-For a release-note friendly summary of the pure Rust parse benchmark (`short`, `long`, `tpch`, `crazy`), run:
-
-```bash
-make bench-rust-parsing-report
-```
-
-This will:
-- run `cargo bench -p polyglot-sql --bench rust_parsing`
-- read Criterion results from `target/criterion/rust_parse_quick_equivalent/parse_one`
-- generate `target/criterion/rust_parsing_report.md` with a Markdown table (mean, std dev, 95% CI, baseline delta if available)
-
-Latest generated result snapshot:
-
-- Generated: 2026-02-26 13:43:10 UTC
-- Source: `target/criterion/rust_parse_quick_equivalent/parse_one`
-
-| Query | Mean | Std Dev | 95% CI (mean) | Change vs baseline |
-|---|---:|---:|---:|---:|
-| short | 51.28 us | 481.03 ns | 51.09 us - 51.60 us | -8.40% |
-| long | 259.61 us | 666.53 ns | 259.23 us - 260.01 us | -5.21% |
-| tpch | 268.59 us | 776.85 ns | 268.15 us - 269.07 us | -0.03% |
-| crazy | 1.03 ms | 66.07 us | 992.65 us - 1.07 ms | +6.05% |
-
 ## Licenses
 
-[MIT](LICENSE)  
-[sqlglot MIT](licenses/SQLGLOT_LICENSE.md)
+[MIT](LICENSE)
