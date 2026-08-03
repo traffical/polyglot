@@ -119,7 +119,11 @@ typedef struct {
 - `polyglot_validate_with_options(sql, dialect, options_json)` (`ValidationOptions` JSON, e.g. `{"strictSyntax": true, "semantic": true}`)
 - `polyglot_optimize(sql, dialect)` (full optimizer pipeline)
 - `polyglot_lineage(column_name, sql, dialect)`
+- `polyglot_lineage_at(ordinal, sql, dialect)` (zero-based ordinal)
+- `polyglot_lineage_at_with_schema(ordinal, sql, schema_json, dialect)` (`ValidationSchema` JSON)
 - `polyglot_lineage_with_schema(column_name, sql, schema_json, dialect)` (`ValidationSchema` JSON)
+- `polyglot_output_columns(sql, dialect)`
+- `polyglot_output_columns_with_schema(sql, schema_json, dialect)` (`ValidationSchema` JSON)
 - `polyglot_source_tables(column_name, sql, dialect)`
 - `polyglot_analyze_query(sql, options_json)` (`AnalyzeQueryOptions` JSON)
   returns compact `QueryAnalysis` JSON. `relations` contains sources visible in
@@ -196,7 +200,11 @@ polyglot_result_t r = polyglot_format_with_options(sql, "generic", opts);
 - `polyglot_format_with_options`: JSON array of SQL strings
 - `polyglot_optimize`: JSON array of SQL strings
 - `polyglot_lineage`: JSON `LineageNode`
+- `polyglot_lineage_at`: JSON `LineageNode`
+- `polyglot_lineage_at_with_schema`: JSON `LineageNode`
 - `polyglot_lineage_with_schema`: JSON `LineageNode`
+- `polyglot_output_columns`: JSON `QueryOutput`
+- `polyglot_output_columns_with_schema`: JSON `QueryOutput`
 - `polyglot_source_tables`: JSON array of source table names
 - `polyglot_analyze_query`: JSON `QueryAnalysis`
 - `polyglot_openlineage_column_lineage`: JSON `OpenLineageColumnLineageResult`
@@ -240,6 +248,11 @@ aliases in this payload.
 wrappers can distinguish physical table sources from virtual sources such as
 BigQuery `UNNEST(...) AS alias`.
 
+`QueryOutput.columns` is ordered and uses tagged `named`, `unnamed`, and
+`wildcard` entries. Each concrete entry carries a zero-based `ordinal` when it
+is knowable; wildcards carry `startOrdinal`. `ordinalComplete` is false when an
+unexpanded wildcard prevents later positions from being known.
+
 ### Validation payloads
 
 - `errors_json`: JSON array of validation error objects:
@@ -258,6 +271,9 @@ BigQuery `UNNEST(...) AS alias`.
 - `4`: validation error
 - `5`: invalid argument (NULL pointer, bad dialect, invalid UTF-8)
 - `6`: JSON serialization/deserialization error
+- `7`: requested output column or ordinal not found
+- `8`: output ordinal indeterminate because a wildcard could not be expanded
+- `9`: requested output name is ambiguous
 - `99`: internal panic/error
 
 ## Memory Ownership Rules

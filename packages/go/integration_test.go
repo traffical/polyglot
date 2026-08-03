@@ -708,6 +708,44 @@ func TestIntegrationLineageAndOpenLineage(t *testing.T) {
 		t.Fatalf("unexpected partial-schema lineage node: %#v", partialSchemaNode)
 	}
 
+	ordinalNode, err := client.LineageAt(
+		1,
+		"SELECT a, b FROM t1 UNION ALL SELECT x, y FROM t2",
+		"generic",
+	)
+	if err != nil {
+		t.Fatalf("LineageAt: %v", err)
+	}
+	ordinalNames := collectLineageNames(ordinalNode)
+	if !containsString(ordinalNames, "t1.b") || !containsString(ordinalNames, "t2.y") {
+		t.Fatalf("unexpected ordinal lineage: %#v", ordinalNames)
+	}
+
+	_, err = client.LineageAt(2, "SELECT a FROM t", "generic")
+	if !errors.Is(err, ErrColumnNotFound) {
+		t.Fatalf("LineageAt error = %v, want ErrColumnNotFound", err)
+	}
+
+	output, err := client.OutputColumns("SELECT 1, t.*, b FROM t", "generic")
+	if err != nil {
+		t.Fatalf("OutputColumns: %v", err)
+	}
+	if output.OrdinalComplete || len(output.Columns) != 3 || output.Columns[1].Kind != OutputColumnWildcard {
+		t.Fatalf("unexpected query output: %#v", output)
+	}
+
+	schemaOutput, err := client.OutputColumnsWithSchema(
+		"SELECT * FROM users",
+		integrationSchema(),
+		"generic",
+	)
+	if err != nil {
+		t.Fatalf("OutputColumnsWithSchema: %v", err)
+	}
+	if !schemaOutput.OrdinalComplete || len(schemaOutput.Columns) == 0 {
+		t.Fatalf("unexpected schema-aware query output: %#v", schemaOutput)
+	}
+
 	options := integrationOpenLineageOptions()
 
 	columnLineage, err := client.OpenLineageColumnLineage("SELECT total FROM orders", options)

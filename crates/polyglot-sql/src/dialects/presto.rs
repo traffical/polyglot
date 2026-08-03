@@ -450,15 +450,15 @@ impl PrestoDialect {
     /// Java:   yyyy, MM, dd, HH, mm, ss, ss, yy, HH:mm:ss, yyyy-MM-dd
     pub fn presto_to_java_format(fmt: &str) -> String {
         fmt.replace("%Y", "yyyy")
-            .replace("%m", "MM")
-            .replace("%d", "dd")
-            .replace("%H", "HH")
-            .replace("%i", "mm")
-            .replace("%S", "ss")
-            .replace("%s", "ss")
+            .replace("%m", "M")
+            .replace("%d", "d")
+            .replace("%H", "H")
+            .replace("%i", "m")
+            .replace("%S", "s")
+            .replace("%s", "s")
             .replace("%y", "yy")
-            .replace("%T", "HH:mm:ss")
-            .replace("%F", "yyyy-MM-dd")
+            .replace("%T", "H:m:s")
+            .replace("%F", "yyyy-M-d")
             .replace("%M", "MMMM")
     }
 

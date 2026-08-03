@@ -206,6 +206,38 @@ func LineageWithSchema(column, sql string, schema ValidationSchema, dialect stri
 	return client.LineageWithSchema(column, sql, schema, dialect)
 }
 
+func LineageAt(ordinal int, sql, dialect string) (LineageNode, error) {
+	client, err := DefaultClient()
+	if err != nil {
+		return LineageNode{}, err
+	}
+	return client.LineageAt(ordinal, sql, dialect)
+}
+
+func LineageAtWithSchema(ordinal int, sql string, schema ValidationSchema, dialect string) (LineageNode, error) {
+	client, err := DefaultClient()
+	if err != nil {
+		return LineageNode{}, err
+	}
+	return client.LineageAtWithSchema(ordinal, sql, schema, dialect)
+}
+
+func OutputColumns(sql, dialect string) (QueryOutput, error) {
+	client, err := DefaultClient()
+	if err != nil {
+		return QueryOutput{}, err
+	}
+	return client.OutputColumns(sql, dialect)
+}
+
+func OutputColumnsWithSchema(sql string, schema ValidationSchema, dialect string) (QueryOutput, error) {
+	client, err := DefaultClient()
+	if err != nil {
+		return QueryOutput{}, err
+	}
+	return client.OutputColumnsWithSchema(sql, schema, dialect)
+}
+
 func SourceTables(column, sql, dialect string) ([]string, error) {
 	client, err := DefaultClient()
 	if err != nil {

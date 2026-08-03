@@ -4237,7 +4237,7 @@ impl Parser {
         let expr = if self.check(TokenType::Values) && self.check_next(TokenType::LParen) {
             // VALUES as table expression: FROM (VALUES ...)
             // In ClickHouse, bare `values` without ( is a table name
-            self.parse_values()?
+            self.parse_values_with_set_operations(false)?
         } else if self.check(TokenType::Values)
             && matches!(
                 self.config.dialect,
@@ -5581,6 +5581,38 @@ impl Parser {
             }
         }
 
+        // Dremio time travel: AT SNAPSHOT expr / AT TIMESTAMP expr.
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::Dremio)
+        ) && self.check_identifier("AT")
+            && self.peek_nth(1).is_some_and(|token| {
+                matches!(
+                    token.text.to_ascii_uppercase().as_str(),
+                    "SNAPSHOT" | "TIMESTAMP"
+                )
+            })
+        {
+            self.skip();
+            let kind = self.advance_text().to_ascii_uppercase();
+            let expression = self
+                .parse_bitwise()?
+                .ok_or_else(|| self.parse_error("Expected Dremio time travel expression"))?;
+            if let Expression::Table(ref mut table) = expr {
+                table.version = Some(Box::new(Version {
+                    this: Box::new(Expression::Identifier(Identifier::new(
+                        if kind == "SNAPSHOT" {
+                            "VERSION"
+                        } else {
+                            "TIMESTAMP"
+                        },
+                    ))),
+                    kind: "AS OF".to_string(),
+                    expression: Some(Box::new(expression)),
+                }));
+            }
+        }
+
         // Check for Snowflake time travel: BEFORE (STATEMENT => ...) or AT (TIMESTAMP => ...)
         if self.check(TokenType::Before) || self.check_keyword_text("AT") {
             if let Some(historical_expr) = self.parse_historical_data()? {
@@ -6339,6 +6371,19 @@ impl Parser {
                 }
                 other => other,
             };
+        }
+
+        // DuckDB also permits Snowflake-style time travel after the table alias.
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::DuckDB)
+        ) && (self.check(TokenType::Before) || self.check_identifier("AT"))
+        {
+            if let Some(Expression::HistoricalData(historical)) = self.parse_historical_data()? {
+                if let Expression::Table(ref mut table) = expr {
+                    table.when = Some(historical);
+                }
+            }
         }
 
         // ClickHouse: subquery column alias list without alias name: FROM (...) (c0, c1)
@@ -10253,8 +10298,8 @@ impl Parser {
                 let (order_by, limit, offset) =
                     Self::detach_unparenthesized_set_operation_modifiers(&mut right);
                 result = Expression::Union(Box::new(Union {
-                    left,
-                    right,
+                    left: Self::wrap_values_set_operand(left),
+                    right: Self::wrap_values_set_operand(right),
                     all,
                     distinct,
                     with: None,
@@ -10294,8 +10339,8 @@ impl Parser {
                 let (order_by, limit, offset) =
                     Self::detach_unparenthesized_set_operation_modifiers(&mut right);
                 result = Expression::Intersect(Box::new(Intersect {
-                    left,
-                    right,
+                    left: Self::wrap_values_set_operand(left),
+                    right: Self::wrap_values_set_operand(right),
                     all,
                     distinct,
                     with: None,
@@ -10335,8 +10380,8 @@ impl Parser {
                 let (order_by, limit, offset) =
                     Self::detach_unparenthesized_set_operation_modifiers(&mut right);
                 result = Expression::Except(Box::new(Except {
-                    left,
-                    right,
+                    left: Self::wrap_values_set_operand(left),
+                    right: Self::wrap_values_set_operand(right),
                     all,
                     distinct,
                     with: None,
@@ -10369,6 +10414,31 @@ impl Parser {
             self.parse_set_operation_modifiers(&mut result)?;
         }
         Ok(result)
+    }
+
+    /// Canonicalize a VALUES set-operation branch as a SELECT from a derived table.
+    /// This keeps VALUES branches addressable by later alias-pushdown transforms and
+    /// matches SQLGlot's set-operation AST shape.
+    fn wrap_values_set_operand(expr: Expression) -> Expression {
+        match expr {
+            Expression::Values(mut values) => {
+                if values.alias.is_none() {
+                    values.alias = Some(Identifier::new("_values"));
+                }
+
+                let mut select = Select::new();
+                select.expressions = vec![Expression::star()];
+                select.from = Some(From {
+                    expressions: vec![Expression::Values(values)],
+                });
+                Expression::Select(Box::new(select))
+            }
+            Expression::Annotated(mut annotated) => {
+                annotated.this = Self::wrap_values_set_operand(annotated.this);
+                Expression::Annotated(annotated)
+            }
+            other => other,
+        }
     }
 
     fn detach_unparenthesized_set_operation_modifiers(
@@ -10978,7 +11048,7 @@ impl Parser {
 
         // Optional column list OR parenthesized subquery
         // We need to check if ( is followed by SELECT/WITH (subquery) or identifiers (column list)
-        let columns = if self.check(TokenType::LParen) {
+        let mut columns = if self.check(TokenType::LParen) {
             // Look ahead to see if this is a subquery or column list
             if self
                 .peek_nth(1)
@@ -11030,6 +11100,32 @@ impl Parser {
             Vec::new()
         };
 
+        // MySQL normalizes INSERT ... SET assignments to a column list and one VALUES row.
+        let insert_set_values = if self.match_token(TokenType::Set) {
+            let mut values = Vec::new();
+            loop {
+                let column = self.expect_identifier_with_quoted()?;
+                self.expect(TokenType::Eq)?;
+                let value = if self.match_token(TokenType::Default) {
+                    Expression::Command(Box::new(crate::expressions::Command {
+                        this: "DEFAULT".to_string(),
+                    }))
+                } else {
+                    self.parse_disjunction()?.ok_or_else(|| {
+                        self.parse_error("Expected column assignment in INSERT ... SET")
+                    })?
+                };
+                columns.push(column);
+                values.push(value);
+                if !self.match_token(TokenType::Comma) {
+                    break;
+                }
+            }
+            Some(values)
+        } else {
+            None
+        };
+
         // Parse OUTPUT clause (TSQL)
         let output = if self.match_token(TokenType::Output) {
             Some(self.parse_output_clause()?)
@@ -11066,7 +11162,9 @@ impl Parser {
         }
 
         // VALUES or SELECT or TABLE source (Hive/Spark) or DEFAULT VALUES (already consumed above)
-        let (values, query) = if default_values {
+        let (values, query) = if let Some(values) = insert_set_values {
+            (vec![values], None)
+        } else if default_values {
             // DEFAULT VALUES: no values or query
             (Vec::new(), None)
         } else if matches!(
@@ -11243,7 +11341,7 @@ impl Parser {
 
         // Parse optional AS alias after VALUES (MySQL: INSERT ... VALUES (...) AS new_data)
         let source_alias = if self.match_token(TokenType::As) {
-            Some(Identifier::new(self.expect_identifier()?))
+            Some(self.expect_identifier_or_keyword_with_quoted()?)
         } else {
             None
         };
@@ -13294,6 +13392,12 @@ impl Parser {
             } else if self.check(TokenType::With) {
                 // Handle WITH ... SELECT ...
                 self.parse_statement()?
+            } else if self.is_identifier_token() {
+                // SQLGlot permits a table expression after AS as a fallback when
+                // the DDL expression is not a SELECT (for example,
+                // CREATE TABLE t AS "source"). Keep it in the general
+                // expression slot so generation preserves the AS form.
+                Expression::Table(Box::new(self.parse_table_ref()?))
             } else {
                 self.parse_select()?
             };
@@ -13369,6 +13473,7 @@ impl Parser {
                 || self.check(TokenType::Sample)
                 || self.check(TokenType::Settings)
                 || self.check(TokenType::Comment)
+                || self.check_text_seq(&["SQL", "SECURITY"])
                 || self.check(TokenType::As);
 
             if starts_props {
@@ -15998,25 +16103,28 @@ impl Parser {
             } else if self.match_token(TokenType::AutoIncrement) || self.match_keyword("IDENTITY") {
                 col_def.auto_increment = true;
                 col_def.constraint_order.push(ConstraintType::AutoIncrement);
-                // Handle IDENTITY/AUTOINCREMENT options: START n INCREMENT m [ORDER|NOORDER] or (start, increment)
-                if self.match_keyword("START") {
-                    col_def.auto_increment_start = Some(Box::new(self.parse_primary()?));
-                    if self.match_keyword("INCREMENT") {
-                        col_def.auto_increment_increment = Some(Box::new(self.parse_primary()?));
-                    }
-                    // Snowflake: ORDER or NOORDER option
-                    if self.match_token(TokenType::Order) {
-                        col_def.auto_increment_order = Some(true);
-                    } else if self.match_identifier("NOORDER") {
-                        col_def.auto_increment_order = Some(false);
-                    }
-                } else if self.match_token(TokenType::LParen) {
+                // IDENTITY/AUTOINCREMENT options form an unordered bag and each
+                // option is independently optional in Snowflake.
+                if self.match_token(TokenType::LParen) {
                     // IDENTITY(start, increment) or AUTOINCREMENT(start, increment)
                     col_def.auto_increment_start = Some(Box::new(self.parse_primary()?));
                     if self.match_token(TokenType::Comma) {
                         col_def.auto_increment_increment = Some(Box::new(self.parse_primary()?));
                     }
                     self.expect(TokenType::RParen)?;
+                }
+                loop {
+                    if self.match_keyword("START") {
+                        col_def.auto_increment_start = Some(Box::new(self.parse_primary()?));
+                    } else if self.match_keyword("INCREMENT") {
+                        col_def.auto_increment_increment = Some(Box::new(self.parse_primary()?));
+                    } else if self.match_token(TokenType::Order) {
+                        col_def.auto_increment_order = Some(true);
+                    } else if self.match_identifier("NOORDER") {
+                        col_def.auto_increment_order = Some(false);
+                    } else {
+                        break;
+                    }
                 }
             } else if self.match_token(TokenType::Default) {
                 // ClickHouse: DEFAULT expressions can be complex (today(), a + 1, cond ? x : y, etc.)
@@ -17671,16 +17779,17 @@ impl Parser {
                 name.clone()
             };
             // ClickHouse: PRIMARY KEY col without parens — parse single column
-            let columns = if matches!(
+            let (columns, timeseries_columns) = if matches!(
                 self.config.dialect,
                 Some(crate::dialects::DialectType::ClickHouse)
             ) && !self.check(TokenType::LParen)
                 && (self.is_identifier_token() || self.is_safe_keyword_as_identifier())
             {
                 let col_name = self.expect_identifier_or_keyword_with_quoted()?;
-                vec![col_name]
+                (vec![col_name], Vec::new())
             } else {
                 self.expect(TokenType::LParen)?;
+                let mut timeseries_columns = Vec::new();
                 // ClickHouse: allow empty PRIMARY KEY ()
                 let cols = if self.check(TokenType::RParen) {
                     Vec::new()
@@ -17699,11 +17808,27 @@ impl Parser {
                         }
                     }
                     exprs
+                } else if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::Databricks)
+                ) {
+                    let mut cols = Vec::new();
+                    loop {
+                        let column = self.expect_identifier_or_keyword_with_quoted()?;
+                        if self.match_identifier("TIMESERIES") {
+                            timeseries_columns.push(column.clone());
+                        }
+                        cols.push(column);
+                        if !self.match_token(TokenType::Comma) {
+                            break;
+                        }
+                    }
+                    cols
                 } else {
                     self.parse_index_identifier_list()?
                 };
                 self.expect(TokenType::RParen)?;
-                cols
+                (cols, timeseries_columns)
             };
             // Parse optional INCLUDE (columns)
             let include_columns = if self.match_identifier("INCLUDE") {
@@ -17721,6 +17846,7 @@ impl Parser {
             Ok(TableConstraint::PrimaryKey {
                 name: actual_name.or(name),
                 columns,
+                timeseries_columns,
                 include_columns,
                 modifiers,
                 has_constraint_keyword,
@@ -19096,12 +19222,14 @@ impl Parser {
                 && !self.check(TokenType::Desc)
                 && !self.check(TokenType::Nulls)
             {
-                let mut opclass_name = self.advance_text();
+                let token = self.advance();
+                let mut opclass_name = self.index_opclass_token_sql(&token);
                 // Handle qualified opclass names like public.gin_trgm_ops
                 while self.match_token(TokenType::Dot) {
                     opclass_name.push('.');
                     if self.is_identifier_token() || self.is_safe_keyword_as_identifier() {
-                        opclass_name.push_str(&self.advance_text());
+                        let token = self.advance();
+                        opclass_name.push_str(&self.index_opclass_token_sql(&token));
                     }
                 }
                 Some(opclass_name)
@@ -19138,6 +19266,21 @@ impl Parser {
             }
         }
         Ok(columns)
+    }
+
+    fn index_opclass_token_sql(&self, token: &Token) -> String {
+        if token.token_type != TokenType::QuotedIdentifier {
+            return token.text.clone();
+        }
+
+        if self.source.is_some() {
+            let original = self.source_text_range(token.span.start, token.span.end);
+            if !original.is_empty() {
+                return original;
+            }
+        }
+
+        format!("\"{}\"", token.text.replace('"', "\"\""))
     }
 
     /// Convert an expression to its SQL string representation (simple version for index expressions)
@@ -19272,6 +19415,7 @@ impl Parser {
                             | "ROLE"
                             | "ROW"
                             | "POLICY"
+                            | "MASKING"
                             | "NAMED"
                             | "WORKLOAD"
                             | "RESOURCE"
@@ -20421,7 +20565,14 @@ impl Parser {
                 // Check for IF EXISTS after COLUMN as well
                 let if_exists =
                     if_exists || self.match_keywords(&[TokenType::If, TokenType::Exists]);
-                let mut name = self.expect_identifier_with_quoted()?;
+                let mut name = if matches!(
+                    self.config.dialect,
+                    Some(crate::dialects::DialectType::ClickHouse)
+                ) {
+                    self.expect_identifier_or_safe_keyword_with_quoted()?
+                } else {
+                    self.expect_identifier_with_quoted()?
+                };
                 // ClickHouse: nested column names like n.ui8
                 if matches!(
                     self.config.dialect,
@@ -21631,6 +21782,13 @@ impl Parser {
 
     /// Parse VALUES table constructor: VALUES (1, 'a'), (2, 'b')
     fn parse_values(&mut self) -> Result<Expression> {
+        self.parse_values_with_set_operations(true)
+    }
+
+    fn parse_values_with_set_operations(
+        &mut self,
+        parse_set_operations: bool,
+    ) -> Result<Expression> {
         self.expect(TokenType::Values)?;
 
         let mut expressions = Vec::new();
@@ -21708,8 +21866,11 @@ impl Parser {
             column_aliases,
         }));
 
-        // Check for set operations after VALUES
-        self.parse_set_operation(values_expr)
+        if parse_set_operations {
+            self.parse_set_operation(values_expr)
+        } else {
+            Ok(values_expr)
+        }
     }
 
     /// Parse USE statement: USE db, USE DATABASE x, USE SCHEMA x.y, USE ROLE x, etc.
@@ -22619,20 +22780,14 @@ impl Parser {
             }
         } else if !extended
             && !formatted
-            && (self.check(TokenType::Identifier)
-                || self.check(TokenType::Var)
-                || self.check(TokenType::QuotedIdentifier))
-            && self.peek_text().eq_ignore_ascii_case("HISTORY")
+            && self.check_identifier("HISTORY")
             && self.peek_nth(1).map(|t| t.token_type) != Some(TokenType::Dot)
         {
             self.skip(); // consume HISTORY
             Some("HISTORY".to_string())
         } else if !extended
             && !formatted
-            && (self.check(TokenType::Identifier)
-                || self.check(TokenType::Var)
-                || self.check(TokenType::QuotedIdentifier))
-            && self.peek_text().eq_ignore_ascii_case("DETAIL")
+            && self.check_identifier("DETAIL")
             && self.peek_nth(1).map(|t| t.token_type) != Some(TokenType::Dot)
         {
             self.skip(); // consume DETAIL
@@ -24956,6 +25111,23 @@ impl Parser {
     fn parse_execute(&mut self) -> Result<Expression> {
         self.expect(TokenType::Execute)?;
 
+        let return_status = if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::TSQL) | Some(crate::dialects::DialectType::Fabric)
+        ) && (self.check(TokenType::Var) || self.check(TokenType::Parameter))
+            && self.check_next(TokenType::Eq)
+        {
+            let token = self.advance();
+            self.skip(); // equals sign
+            Some(if token.text.starts_with('@') {
+                token.text
+            } else {
+                format!("@{}", token.text)
+            })
+        } else {
+            None
+        };
+
         // Dynamic SQL: EXEC(@sql) or EXEC (@sql)
         let this = if self.check(TokenType::LParen) {
             self.skip(); // consume (
@@ -24977,6 +25149,7 @@ impl Parser {
             let arguments = self.parse_wrapped_csv_expressions()?;
             return Ok(Expression::Execute(Box::new(ExecuteStatement {
                 this,
+                return_status,
                 parameters: Vec::new(),
                 arguments,
                 prepared: true,
@@ -24988,6 +25161,7 @@ impl Parser {
         {
             return Ok(Expression::Execute(Box::new(ExecuteStatement {
                 this,
+                return_status,
                 parameters: Vec::new(),
                 arguments: Vec::new(),
                 prepared: true,
@@ -25057,6 +25231,7 @@ impl Parser {
 
         Ok(Expression::Execute(Box::new(ExecuteStatement {
             this,
+            return_status,
             parameters,
             arguments: Vec::new(),
             prepared: false,
@@ -26029,13 +26204,16 @@ impl Parser {
             && !self.check(TokenType::Percent)
             && !self.check(TokenType::Only)
         {
-            // Accept number, parenthesized expression, or TSQL @variable (Var token)
+            // Accept numbers, signed expressions, parenthesized expressions, or TSQL
+            // @variables (Var token).
             if self.check(TokenType::Number)
+                || self.check(TokenType::Dash)
+                || self.check(TokenType::Plus)
                 || self.check(TokenType::LParen)
                 || self.check(TokenType::DAt)
                 || self.check(TokenType::Var)
             {
-                Some(self.parse_primary()?)
+                Some(self.parse_unary()?)
             } else {
                 None
             }
@@ -29802,7 +29980,44 @@ impl Parser {
                 return Ok(left);
             };
 
-            left = expr;
+            let expr = if matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::SQLite)
+            ) {
+                match expr {
+                    Expression::In(mut in_expr) if in_expr.not => {
+                        in_expr.not = false;
+                        Expression::Not(Box::new(UnaryOp::new(Expression::In(in_expr))))
+                    }
+                    other => other,
+                }
+            } else {
+                expr
+            };
+            let needs_sqlite_range_parens = matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::SQLite)
+            ) && matches!(&expr, Expression::Not(op) if matches!(&op.this, Expression::In(_)))
+                && matches!(
+                    self.peek().token_type,
+                    TokenType::Not
+                        | TokenType::In
+                        | TokenType::Is
+                        | TokenType::Between
+                        | TokenType::Like
+                        | TokenType::ILike
+                        | TokenType::RLike
+                        | TokenType::Glob
+                        | TokenType::Match
+                );
+            left = if needs_sqlite_range_parens {
+                Expression::Paren(Box::new(Paren {
+                    this: expr,
+                    trailing_comments: Vec::new(),
+                }))
+            } else {
+                expr
+            };
         }
     }
 
@@ -30079,8 +30294,14 @@ impl Parser {
     fn parse_at_time_zone(&mut self) -> Result<Expression> {
         let mut expr = self.parse_multiplication()?;
 
-        // Check for AT TIME ZONE (can be chained)
-        while self.check(TokenType::Var) && self.peek_text().eq_ignore_ascii_case("AT") {
+        // Check for AT TIME ZONE / AT LOCAL (can be chained). Keep an unrelated
+        // `AT` available to the alias parser for backward-compatible identifiers.
+        while self.check(TokenType::Var)
+            && self.peek_text().eq_ignore_ascii_case("AT")
+            && self
+                .peek_nth(1)
+                .is_some_and(|token| matches!(token.token_type, TokenType::Time | TokenType::Local))
+        {
             self.skip(); // consume AT
                          // Check for TIME ZONE
             if self.check(TokenType::Time) {
@@ -30092,6 +30313,11 @@ impl Parser {
                 } else {
                     return Err(self.parse_error("Expected ZONE after AT TIME"));
                 }
+            } else if self.match_token(TokenType::Local) {
+                expr = Expression::AtTimeZone(Box::new(AtTimeZone {
+                    this: expr,
+                    zone: Expression::Identifier(Identifier::new("LOCAL")),
+                }));
             } else {
                 return Err(self.parse_error("Expected TIME after AT"));
             }
@@ -33236,6 +33462,23 @@ impl Parser {
             // EscapeString is stored as "E'content'" - extract just the content
             let literal = Expression::Literal(Box::new(Literal::EscapeString(token.text)));
             return self.maybe_parse_subscript(literal);
+        }
+
+        // PostgreSQL Unicode escape string: U&'...' [UESCAPE 'x']
+        if self.check(TokenType::UnicodeString) {
+            let token = self.advance();
+            let this = Expression::Literal(Box::new(Literal::String(token.text)));
+            let escape = if self.match_identifier("UESCAPE") {
+                Some(Box::new(self.parse_primary()?))
+            } else {
+                None
+            };
+            return self.maybe_parse_subscript(Expression::UnicodeString(Box::new(
+                UnicodeString {
+                    this: Box::new(this),
+                    escape,
+                },
+            )));
         }
 
         // Star - check for DuckDB *COLUMNS(...) syntax first
@@ -38593,7 +38836,7 @@ impl Parser {
                     let ident_token = self.advance();
                     let ident_name = ident_token.text.to_string();
                     if self.match_token(TokenType::FArrow) {
-                        let value = self.parse_expression()?;
+                        let value = self.parse_function_argument_value()?;
                         Expression::NamedArgument(Box::new(NamedArgument {
                             name: Identifier::new(ident_name),
                             value,
@@ -38656,7 +38899,7 @@ impl Parser {
                     parameter_types: Vec::new(),
                 }))
             } else if self.match_token(TokenType::FArrow) {
-                let value = self.parse_expression()?;
+                let value = self.parse_function_argument_value()?;
                 Expression::NamedArgument(Box::new(NamedArgument {
                     name: Identifier::new(ident_name),
                     value,
@@ -38739,6 +38982,18 @@ impl Parser {
                 }
                 _ => arg,
             })
+        }
+    }
+
+    fn parse_function_argument_value(&mut self) -> Result<Expression> {
+        if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::Snowflake)
+        ) && (self.check(TokenType::Select) || self.check(TokenType::With))
+        {
+            self.parse_statement()
+        } else {
+            self.parse_expression()
         }
     }
 
@@ -40918,7 +41173,8 @@ impl Parser {
         if self.is_at_end() {
             return false;
         }
-        if self.peek_text().eq_ignore_ascii_case(keyword) {
+        if self.current_token_allows_text_match() && self.peek_text().eq_ignore_ascii_case(keyword)
+        {
             self.skip();
             true
         } else {
@@ -40932,7 +41188,10 @@ impl Parser {
             if self.current + i >= self.tokens.len() {
                 return false;
             }
-            if !self.tokens[self.current + i].text.eq_ignore_ascii_case(kw) {
+            let token = &self.tokens[self.current + i];
+            if Self::text_match_excludes_token(token.token_type)
+                || !token.text.eq_ignore_ascii_case(kw)
+            {
                 return false;
             }
         }
@@ -40946,7 +41205,10 @@ impl Parser {
             if self.current + i >= self.tokens.len() {
                 return false;
             }
-            if !self.tokens[self.current + i].text.eq_ignore_ascii_case(kw) {
+            let token = &self.tokens[self.current + i];
+            if Self::text_match_excludes_token(token.token_type)
+                || !token.text.eq_ignore_ascii_case(kw)
+            {
                 return false;
             }
         }
@@ -40956,6 +41218,9 @@ impl Parser {
     /// Match any of the given texts (case-insensitive)
     fn match_texts(&mut self, texts: &[&str]) -> bool {
         if self.is_at_end() {
+            return false;
+        }
+        if !self.current_token_allows_text_match() {
             return false;
         }
         for text in texts {
@@ -44672,6 +44937,33 @@ impl Parser {
         }
     }
 
+    /// Tokens whose text came from delimited source must never be reinterpreted
+    /// as keywords by the text-matching helpers. This mirrors SQLGlot's
+    /// `TEXT_MATCH_EXCLUDED_TOKENS` behavior for this token model.
+    fn text_match_excludes_token(token_type: TokenType) -> bool {
+        matches!(
+            token_type,
+            TokenType::QuotedIdentifier
+                | TokenType::String
+                | TokenType::DollarString
+                | TokenType::TripleDoubleQuotedString
+                | TokenType::TripleSingleQuotedString
+                | TokenType::BitString
+                | TokenType::HexString
+                | TokenType::ByteString
+                | TokenType::NationalString
+                | TokenType::EscapeString
+                | TokenType::RawString
+                | TokenType::HeredocString
+                | TokenType::HeredocStringAlternative
+                | TokenType::UnicodeString
+        )
+    }
+
+    fn current_token_allows_text_match(&self) -> bool {
+        !self.is_at_end() && !Self::text_match_excludes_token(self.peek().token_type)
+    }
+
     /// Check if current token is a keyword
     fn check_keyword(&self) -> bool {
         if self.is_at_end() {
@@ -44705,7 +44997,7 @@ impl Parser {
         if self.is_at_end() {
             false
         } else {
-            self.peek_text().eq_ignore_ascii_case(keyword)
+            self.current_token_allows_text_match() && self.peek_text().eq_ignore_ascii_case(keyword)
         }
     }
 
@@ -44735,11 +45027,10 @@ impl Parser {
     }
 
     /// Match an identifier with specific text (case insensitive)
-    /// Checks for Identifier, Var, and QuotedIdentifier tokens
+    /// Quoted identifiers are deliberately excluded: contextual keywords must not
+    /// consume delimited names such as `"concurrently"` or `"history"`.
     fn match_identifier(&mut self, text: &str) -> bool {
-        if (self.check(TokenType::Identifier)
-            || self.check(TokenType::Var)
-            || self.check(TokenType::QuotedIdentifier))
+        if (self.check(TokenType::Identifier) || self.check(TokenType::Var))
             && self.peek_text().eq_ignore_ascii_case(text)
         {
             self.skip();
@@ -44755,9 +45046,7 @@ impl Parser {
         if self.is_at_end() {
             return false;
         }
-        (self.check(TokenType::Identifier)
-            || self.check(TokenType::Var)
-            || self.check(TokenType::QuotedIdentifier))
+        (self.check(TokenType::Identifier) || self.check(TokenType::Var))
             && self.peek_text().eq_ignore_ascii_case(text)
     }
 
@@ -56942,6 +57231,16 @@ impl Parser {
                 properties.push(Expression::SchemaCommentProperty(Box::new(
                     SchemaCommentProperty {
                         this: Box::new(comment_expr),
+                    },
+                )));
+                continue;
+            }
+
+            if self.match_text_seq(&["SQL", "SECURITY"]) {
+                let security = self.expect_identifier_or_safe_keyword_with_quoted()?;
+                properties.push(Expression::SqlSecurityProperty(Box::new(
+                    SqlSecurityProperty {
+                        this: Box::new(Expression::Identifier(security)),
                     },
                 )));
                 continue;

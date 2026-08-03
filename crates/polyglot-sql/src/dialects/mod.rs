@@ -581,6 +581,21 @@ fn presto_to_java_format(fmt: &str) -> String {
 }
 
 #[cfg(feature = "transpile")]
+fn presto_to_java_parse_format(fmt: &str) -> String {
+    fmt.replace("%Y", "yyyy")
+        .replace("%m", "M")
+        .replace("%d", "d")
+        .replace("%H", "H")
+        .replace("%i", "m")
+        .replace("%S", "s")
+        .replace("%s", "s")
+        .replace("%y", "yy")
+        .replace("%T", "H:m:s")
+        .replace("%F", "yyyy-M-d")
+        .replace("%M", "MMMM")
+}
+
+#[cfg(feature = "transpile")]
 fn normalize_presto_format(fmt: &str) -> String {
     fmt.replace("%H:%i:%S", "%T").replace("%H:%i:%s", "%T")
 }

@@ -54,6 +54,8 @@ impl DialectImpl for OracleDialect {
             alias_post_tablesample: true,
             // Oracle uses TIMESTAMP WITH TIME ZONE syntax (not TIMESTAMPTZ)
             tz_to_with_time_zone: true,
+            // Oracle UNPIVOT aliases retain literal aliases as literals.
+            unpivot_aliases_are_identifiers: false,
             ..Default::default()
         }
     }

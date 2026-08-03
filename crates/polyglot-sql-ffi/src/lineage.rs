@@ -1,9 +1,14 @@
 use crate::helpers::{
-    dialect_by_name, dialect_option_for_lineage, err_result, ok_json_result, panic_result,
-    parse_single_statement, required_arg,
+    dialect_by_name, dialect_option_for_lineage, err_result, map_polyglot_error, ok_json_result,
+    panic_result, parse_single_statement, required_arg,
 };
 use crate::types::{PolyglotResult, STATUS_PARSE_ERROR, STATUS_SERIALIZATION_ERROR};
-use polyglot_sql::lineage::{get_source_tables, lineage as compute_lineage};
+use polyglot_sql::lineage::{
+    get_source_tables, lineage as compute_lineage, lineage_at as compute_lineage_at,
+    lineage_at_with_schema as compute_lineage_at_with_schema,
+    output_columns as compute_output_columns,
+    output_columns_with_schema as compute_output_columns_with_schema,
+};
 use polyglot_sql::mapping_schema_from_validation_schema_with_dialect;
 use std::os::raw::c_char;
 
@@ -31,6 +36,60 @@ pub extern "C" fn polyglot_lineage_with_schema(
     match std::panic::catch_unwind(|| {
         lineage_with_schema_impl(column_name, sql, schema_json, dialect)
     }) {
+        Ok(result) => result,
+        Err(panic) => panic_result(panic),
+    }
+}
+
+/// Trace lineage for a zero-based output ordinal.
+#[no_mangle]
+pub extern "C" fn polyglot_lineage_at(
+    ordinal: usize,
+    sql: *const c_char,
+    dialect: *const c_char,
+) -> PolyglotResult {
+    match std::panic::catch_unwind(|| lineage_at_impl(ordinal, sql, dialect)) {
+        Ok(result) => result,
+        Err(panic) => panic_result(panic),
+    }
+}
+
+/// Trace lineage for a zero-based output ordinal using schema metadata.
+#[no_mangle]
+pub extern "C" fn polyglot_lineage_at_with_schema(
+    ordinal: usize,
+    sql: *const c_char,
+    schema_json: *const c_char,
+    dialect: *const c_char,
+) -> PolyglotResult {
+    match std::panic::catch_unwind(|| {
+        lineage_at_with_schema_impl(ordinal, sql, schema_json, dialect)
+    }) {
+        Ok(result) => result,
+        Err(panic) => panic_result(panic),
+    }
+}
+
+/// Describe the query's ordered output columns.
+#[no_mangle]
+pub extern "C" fn polyglot_output_columns(
+    sql: *const c_char,
+    dialect: *const c_char,
+) -> PolyglotResult {
+    match std::panic::catch_unwind(|| output_columns_impl(sql, dialect)) {
+        Ok(result) => result,
+        Err(panic) => panic_result(panic),
+    }
+}
+
+/// Describe ordered output columns after schema-aware wildcard expansion.
+#[no_mangle]
+pub extern "C" fn polyglot_output_columns_with_schema(
+    sql: *const c_char,
+    schema_json: *const c_char,
+    dialect: *const c_char,
+) -> PolyglotResult {
+    match std::panic::catch_unwind(|| output_columns_with_schema_impl(sql, schema_json, dialect)) {
         Ok(result) => result,
         Err(panic) => panic_result(panic),
     }
@@ -83,7 +142,69 @@ fn lineage_impl(
         false,
     ) {
         Ok(node) => ok_json_result(&node),
-        Err(error) => err_result(STATUS_PARSE_ERROR, error.to_string()),
+        Err(error) => err_result(
+            map_polyglot_error(&error, STATUS_PARSE_ERROR),
+            error.to_string(),
+        ),
+    }
+}
+
+fn lineage_at_impl(ordinal: usize, sql: *const c_char, dialect: *const c_char) -> PolyglotResult {
+    let sql = match unsafe { required_arg(sql, "sql") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let dialect_name = match unsafe { required_arg(dialect, "dialect") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let dialect = match dialect_by_name(&dialect_name) {
+        Ok(dialect) => dialect,
+        Err(result) => return result,
+    };
+    let expression = match parse_single_statement(&sql, &dialect, &dialect_name) {
+        Ok(expression) => expression,
+        Err(result) => return result,
+    };
+
+    match compute_lineage_at(
+        ordinal,
+        &expression,
+        dialect_option_for_lineage(&dialect),
+        false,
+    ) {
+        Ok(node) => ok_json_result(&node),
+        Err(error) => err_result(
+            map_polyglot_error(&error, STATUS_PARSE_ERROR),
+            error.to_string(),
+        ),
+    }
+}
+
+fn output_columns_impl(sql: *const c_char, dialect: *const c_char) -> PolyglotResult {
+    let sql = match unsafe { required_arg(sql, "sql") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let dialect_name = match unsafe { required_arg(dialect, "dialect") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let dialect = match dialect_by_name(&dialect_name) {
+        Ok(dialect) => dialect,
+        Err(result) => return result,
+    };
+    let expression = match parse_single_statement(&sql, &dialect, &dialect_name) {
+        Ok(expression) => expression,
+        Err(result) => return result,
+    };
+
+    match compute_output_columns(&expression, dialect_option_for_lineage(&dialect)) {
+        Ok(output) => ok_json_result(&output),
+        Err(error) => err_result(
+            map_polyglot_error(&error, STATUS_PARSE_ERROR),
+            error.to_string(),
+        ),
     }
 }
 
@@ -126,7 +247,10 @@ fn source_tables_impl(
             sorted.sort();
             ok_json_result(&sorted)
         }
-        Err(error) => err_result(STATUS_PARSE_ERROR, error.to_string()),
+        Err(error) => err_result(
+            map_polyglot_error(&error, STATUS_PARSE_ERROR),
+            error.to_string(),
+        ),
     }
 }
 
@@ -184,6 +308,118 @@ fn lineage_with_schema_impl(
         false,
     ) {
         Ok(node) => ok_json_result(&node),
-        Err(error) => err_result(STATUS_PARSE_ERROR, error.to_string()),
+        Err(error) => err_result(
+            map_polyglot_error(&error, STATUS_PARSE_ERROR),
+            error.to_string(),
+        ),
+    }
+}
+
+fn lineage_at_with_schema_impl(
+    ordinal: usize,
+    sql: *const c_char,
+    schema_json: *const c_char,
+    dialect: *const c_char,
+) -> PolyglotResult {
+    let sql = match unsafe { required_arg(sql, "sql") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let schema_json = match unsafe { required_arg(schema_json, "schema_json") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let dialect_name = match unsafe { required_arg(dialect, "dialect") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let dialect = match dialect_by_name(&dialect_name) {
+        Ok(dialect) => dialect,
+        Err(result) => return result,
+    };
+    let expression = match parse_single_statement(&sql, &dialect, &dialect_name) {
+        Ok(expression) => expression,
+        Err(result) => return result,
+    };
+    let validation_schema =
+        match serde_json::from_str::<polyglot_sql::ValidationSchema>(&schema_json) {
+            Ok(schema) => schema,
+            Err(error) => {
+                return err_result(
+                    STATUS_SERIALIZATION_ERROR,
+                    format!("Invalid schema JSON: {}", error),
+                );
+            }
+        };
+    let mapping_schema = mapping_schema_from_validation_schema_with_dialect(
+        &validation_schema,
+        dialect.dialect_type(),
+    );
+
+    match compute_lineage_at_with_schema(
+        ordinal,
+        &expression,
+        Some(&mapping_schema),
+        dialect_option_for_lineage(&dialect),
+        false,
+    ) {
+        Ok(node) => ok_json_result(&node),
+        Err(error) => err_result(
+            map_polyglot_error(&error, STATUS_PARSE_ERROR),
+            error.to_string(),
+        ),
+    }
+}
+
+fn output_columns_with_schema_impl(
+    sql: *const c_char,
+    schema_json: *const c_char,
+    dialect: *const c_char,
+) -> PolyglotResult {
+    let sql = match unsafe { required_arg(sql, "sql") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let schema_json = match unsafe { required_arg(schema_json, "schema_json") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let dialect_name = match unsafe { required_arg(dialect, "dialect") } {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let dialect = match dialect_by_name(&dialect_name) {
+        Ok(dialect) => dialect,
+        Err(result) => return result,
+    };
+    let expression = match parse_single_statement(&sql, &dialect, &dialect_name) {
+        Ok(expression) => expression,
+        Err(result) => return result,
+    };
+    let validation_schema =
+        match serde_json::from_str::<polyglot_sql::ValidationSchema>(&schema_json) {
+            Ok(schema) => schema,
+            Err(error) => {
+                return err_result(
+                    STATUS_SERIALIZATION_ERROR,
+                    format!("Invalid schema JSON: {}", error),
+                );
+            }
+        };
+    let mapping_schema = mapping_schema_from_validation_schema_with_dialect(
+        &validation_schema,
+        dialect.dialect_type(),
+    );
+
+    match compute_output_columns_with_schema(
+        &expression,
+        Some(&mapping_schema),
+        dialect_option_for_lineage(&dialect),
+    ) {
+        Ok(output) => ok_json_result(&output),
+        Err(error) => err_result(
+            map_polyglot_error(&error, STATUS_PARSE_ERROR),
+            error.to_string(),
+        ),
     }
 }

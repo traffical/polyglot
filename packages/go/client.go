@@ -372,6 +372,64 @@ func (c *Client) LineageWithSchema(column, sql string, schema ValidationSchema, 
 	return node, err
 }
 
+func (c *Client) LineageAt(ordinal int, sql, dialect string) (LineageNode, error) {
+	if ordinal < 0 {
+		return LineageNode{}, fmt.Errorf("polyglot: output ordinal must be non-negative")
+	}
+	if err := rejectNUL(sql, dialect); err != nil {
+		return LineageNode{}, err
+	}
+	var node LineageNode
+	err := c.callJSON("lineage_at", func(lib *ffi.Library) ffi.Result {
+		return lib.LineageAt(uint64(ordinal), sql, defaultDialect(dialect))
+	}, &node)
+	return node, err
+}
+
+func (c *Client) LineageAtWithSchema(ordinal int, sql string, schema ValidationSchema, dialect string) (LineageNode, error) {
+	if ordinal < 0 {
+		return LineageNode{}, fmt.Errorf("polyglot: output ordinal must be non-negative")
+	}
+	schemaJSON, err := marshalOptions(schema)
+	if err != nil {
+		return LineageNode{}, err
+	}
+	if err := rejectNUL(sql, schemaJSON, dialect); err != nil {
+		return LineageNode{}, err
+	}
+	var node LineageNode
+	err = c.callJSON("lineage_at_with_schema", func(lib *ffi.Library) ffi.Result {
+		return lib.LineageAtWithSchema(uint64(ordinal), sql, schemaJSON, defaultDialect(dialect))
+	}, &node)
+	return node, err
+}
+
+func (c *Client) OutputColumns(sql, dialect string) (QueryOutput, error) {
+	if err := rejectNUL(sql, dialect); err != nil {
+		return QueryOutput{}, err
+	}
+	var output QueryOutput
+	err := c.callJSON("output_columns", func(lib *ffi.Library) ffi.Result {
+		return lib.OutputColumns(sql, defaultDialect(dialect))
+	}, &output)
+	return output, err
+}
+
+func (c *Client) OutputColumnsWithSchema(sql string, schema ValidationSchema, dialect string) (QueryOutput, error) {
+	schemaJSON, err := marshalOptions(schema)
+	if err != nil {
+		return QueryOutput{}, err
+	}
+	if err := rejectNUL(sql, schemaJSON, dialect); err != nil {
+		return QueryOutput{}, err
+	}
+	var output QueryOutput
+	err = c.callJSON("output_columns_with_schema", func(lib *ffi.Library) ffi.Result {
+		return lib.OutputColumnsWithSchema(sql, schemaJSON, defaultDialect(dialect))
+	}, &output)
+	return output, err
+}
+
 func (c *Client) SourceTables(column, sql, dialect string) ([]string, error) {
 	if err := rejectNUL(column, sql, dialect); err != nil {
 		return nil, err

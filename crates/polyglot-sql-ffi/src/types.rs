@@ -8,6 +8,9 @@ pub const STATUS_TRANSPILE_ERROR: i32 = 3;
 pub const STATUS_VALIDATION_ERROR: i32 = 4;
 pub const STATUS_INVALID_ARGUMENT: i32 = 5;
 pub const STATUS_SERIALIZATION_ERROR: i32 = 6;
+pub const STATUS_COLUMN_NOT_FOUND: i32 = 7;
+pub const STATUS_COLUMN_INDETERMINATE: i32 = 8;
+pub const STATUS_COLUMN_AMBIGUOUS: i32 = 9;
 pub const STATUS_INTERNAL_ERROR: i32 = 99;
 
 /// Common result payload for string-returning FFI functions.

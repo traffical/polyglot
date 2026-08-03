@@ -2,9 +2,11 @@ use polyglot_sql_ffi::{
     polyglot_analyze_query, polyglot_annotate_types, polyglot_dialect_count, polyglot_dialect_list,
     polyglot_diff, polyglot_format, polyglot_format_with_options, polyglot_free_result,
     polyglot_free_string, polyglot_free_validation_result, polyglot_generate,
-    polyglot_generate_data_type, polyglot_lineage, polyglot_lineage_with_schema,
+    polyglot_generate_data_type, polyglot_lineage, polyglot_lineage_at,
+    polyglot_lineage_at_with_schema, polyglot_lineage_with_schema,
     polyglot_openlineage_column_lineage, polyglot_openlineage_job_event,
-    polyglot_openlineage_run_event, polyglot_optimize, polyglot_parse, polyglot_parse_data_type,
+    polyglot_openlineage_run_event, polyglot_optimize, polyglot_output_columns,
+    polyglot_output_columns_with_schema, polyglot_parse, polyglot_parse_data_type,
     polyglot_parse_one, polyglot_qualify_tables, polyglot_rename_tables_with_options,
     polyglot_set_limit, polyglot_set_offset, polyglot_set_order_by, polyglot_source_tables,
     polyglot_tokenize, polyglot_transpile, polyglot_transpile_with_options, polyglot_validate,
@@ -834,6 +836,105 @@ fn test_lineage_schema_less_cte_star_passthrough() {
 }
 
 #[test]
+fn test_lineage_at_traces_set_operation_by_zero_based_ordinal() {
+    let sql = c("SELECT a, b FROM t1 UNION ALL SELECT x, y FROM t2");
+    let dialect = c("generic");
+    let (status, data, error) =
+        consume_result(polyglot_lineage_at(1, sql.as_ptr(), dialect.as_ptr()));
+    assert_eq!(status, 0, "error={error:?}");
+    let node: Value = serde_json::from_str(&data.expect("missing lineage")).expect("invalid json");
+
+    let mut names = Vec::new();
+    collect_lineage_names(&node, &mut names);
+    assert!(names.iter().any(|name| name == "t1.b"));
+    assert!(names.iter().any(|name| name == "t2.y"));
+}
+
+#[test]
+fn test_lineage_at_returns_stable_not_found_status() {
+    let sql = c("SELECT a FROM t");
+    let dialect = c("generic");
+    let (status, data, error) =
+        consume_result(polyglot_lineage_at(2, sql.as_ptr(), dialect.as_ptr()));
+
+    assert_eq!(status, 7);
+    assert!(data.is_none());
+    assert!(error.expect("missing error").contains("not found"));
+}
+
+#[test]
+fn test_lineage_resolution_statuses_distinguish_indeterminate_and_ambiguous() {
+    let dialect = c("generic");
+    let wildcard_sql = c("SELECT *, tail FROM t");
+    let (status, _, error) = consume_result(polyglot_lineage_at(
+        1,
+        wildcard_sql.as_ptr(),
+        dialect.as_ptr(),
+    ));
+    assert_eq!(status, 8);
+    assert!(error.expect("missing error").contains("indeterminate"));
+
+    let column = c("dup");
+    let duplicate_sql = c("SELECT a AS dup, b AS dup FROM t");
+    let (status, _, error) = consume_result(polyglot_lineage(
+        column.as_ptr(),
+        duplicate_sql.as_ptr(),
+        dialect.as_ptr(),
+    ));
+    assert_eq!(status, 9);
+    assert!(error.expect("missing error").contains("ambiguous"));
+}
+
+#[test]
+fn test_output_columns_preserves_unnamed_slots_and_wildcards() {
+    let sql = c("SELECT 1, t.*, b FROM t");
+    let dialect = c("generic");
+    let (status, data, error) =
+        consume_result(polyglot_output_columns(sql.as_ptr(), dialect.as_ptr()));
+    assert_eq!(status, 0, "error={error:?}");
+    let output: Value =
+        serde_json::from_str(&data.expect("missing output columns")).expect("invalid json");
+
+    assert_eq!(output["ordinalComplete"], false);
+    assert_eq!(output["columns"][0]["kind"], "unnamed");
+    assert_eq!(output["columns"][1]["kind"], "wildcard");
+    assert_eq!(output["columns"][1]["startOrdinal"], 1);
+    assert!(output["columns"][2]["ordinal"].is_null());
+}
+
+#[test]
+fn test_schema_aware_ordinal_and_output_functions_are_exported() {
+    let sql = c("SELECT * FROM t");
+    let schema = c(
+        r#"{"tables":[{"name":"t","columns":[{"name":"a","type":"INT"},{"name":"b","type":"INT"}]}]}"#,
+    );
+    let dialect = c("generic");
+
+    let (status, data, error) = consume_result(polyglot_lineage_at_with_schema(
+        1,
+        sql.as_ptr(),
+        schema.as_ptr(),
+        dialect.as_ptr(),
+    ));
+    assert_eq!(status, 0, "error={error:?}");
+    let node: Value = serde_json::from_str(&data.expect("missing lineage")).expect("invalid json");
+    let mut names = Vec::new();
+    collect_lineage_names(&node, &mut names);
+    assert!(names.iter().any(|name| name == "t.b"));
+
+    let (status, data, error) = consume_result(polyglot_output_columns_with_schema(
+        sql.as_ptr(),
+        schema.as_ptr(),
+        dialect.as_ptr(),
+    ));
+    assert_eq!(status, 0, "error={error:?}");
+    let output: Value =
+        serde_json::from_str(&data.expect("missing output columns")).expect("invalid json");
+    assert_eq!(output["columns"].as_array().map(Vec::len), Some(2));
+    assert_eq!(output["ordinalComplete"], true);
+}
+
+#[test]
 fn test_lineage_nested_set_operation_inside_derived_table() {
     let column = c("v");
     let sql = c(
@@ -1411,7 +1512,15 @@ fn test_public_api_matches_capability_contract() {
             polyglot_set_offset,
             polyglot_set_order_by
         },
-        "lineage" => { polyglot_lineage, polyglot_lineage_with_schema, polyglot_source_tables },
+        "lineage" => {
+            polyglot_lineage,
+            polyglot_lineage_at,
+            polyglot_lineage_at_with_schema,
+            polyglot_lineage_with_schema,
+            polyglot_output_columns,
+            polyglot_output_columns_with_schema,
+            polyglot_source_tables
+        },
         "openlineage" => {
             polyglot_openlineage_column_lineage,
             polyglot_openlineage_job_event,

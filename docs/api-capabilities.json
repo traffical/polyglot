@@ -174,12 +174,12 @@
       "id": "lineage",
       "description": "Column lineage and source table discovery",
       "layers": {
-        "rust": { "status": "supported", "symbols": ["lineage.lineage", "lineage.lineage_with_schema", "lineage.get_source_tables"] },
-        "python": { "status": "supported", "symbols": ["lineage", "lineage_with_schema", "source_tables"] },
-        "ffi": { "status": "supported", "symbols": ["polyglot_lineage", "polyglot_lineage_with_schema", "polyglot_source_tables"] },
-        "go": { "status": "supported", "symbols": ["Client.Lineage", "Client.LineageWithSchema", "Client.SourceTables"] },
-        "wasm": { "status": "supported", "symbols": ["lineage_sql", "lineage_sql_with_schema", "source_tables"] },
-        "typescript": { "status": "supported", "symbols": ["lineage", "lineageWithSchema", "getSourceTables"] }
+        "rust": { "status": "supported", "symbols": ["lineage.lineage", "lineage.lineage_at", "lineage.lineage_at_with_schema", "lineage.lineage_with_schema", "lineage.output_columns", "lineage.output_columns_with_schema", "lineage.get_source_tables"] },
+        "python": { "status": "supported", "symbols": ["lineage", "lineage_at", "lineage_at_with_schema", "lineage_with_schema", "output_columns", "output_columns_with_schema", "source_tables"] },
+        "ffi": { "status": "supported", "symbols": ["polyglot_lineage", "polyglot_lineage_at", "polyglot_lineage_at_with_schema", "polyglot_lineage_with_schema", "polyglot_output_columns", "polyglot_output_columns_with_schema", "polyglot_source_tables"] },
+        "go": { "status": "supported", "symbols": ["Client.Lineage", "Client.LineageAt", "Client.LineageAtWithSchema", "Client.LineageWithSchema", "Client.OutputColumns", "Client.OutputColumnsWithSchema", "Client.SourceTables"] },
+        "wasm": { "status": "supported", "symbols": ["lineage_sql", "lineage_sql_at", "lineage_sql_at_with_schema", "lineage_sql_with_schema", "output_columns_sql", "output_columns_sql_with_schema", "source_tables"] },
+        "typescript": { "status": "supported", "symbols": ["lineage", "lineageAt", "lineageAtWithSchema", "lineageWithSchema", "outputColumns", "outputColumnsWithSchema", "getSourceTables"] }
       }
     },
     {

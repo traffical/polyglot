@@ -4,6 +4,29 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.7.0] - 2026-08-03
+
+### Added
+- Column lineage can now target a zero-based output ordinal, including across
+  `UNION`, `INTERSECT`, and `EXCEPT` branches whose output names differ. The
+  ordinal APIs are available in Rust, Python, C, Go, WASM, and TypeScript, with
+  schema-aware variants in every binding.
+- New output-column inspection APIs preserve projection order, unnamed
+  expressions, and unresolved qualified or unqualified wildcards. Returned
+  metadata reports whether all output ordinals are known and can expand stars
+  when schema metadata is supplied.
+- Column-resolution failures now distinguish `not_found`, `indeterminate`, and
+  `ambiguous` outcomes. Python exposes `ColumnResolutionError`, C uses stable
+  status codes, Go provides `errors.Is`-compatible sentinels, and WASM/
+  TypeScript return structured failure metadata.
+
+### Fixed
+- Positional lineage for set operations now keeps the resolvable branches when
+  another branch has an unresolved wildcard, while still reporting an
+  indeterminate result when no branch can establish the requested position.
+- Name-based lineage no longer guesses when duplicate output aliases make the
+  requested name ambiguous.
+
 ## [0.6.3] - 2026-08-02
 
 ### Added

@@ -6,6 +6,7 @@
 //!
 
 use crate::dialects::DialectType;
+use crate::error::{ColumnResolutionReason, ColumnResolutionTarget};
 use crate::expressions::{DataType, Expression, Identifier, JoinKind, NamedWindow, Select, With};
 #[cfg(feature = "generate")]
 use crate::generator::Generator;
@@ -18,6 +19,41 @@ use crate::scope::{
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+/// The ordered output description of a query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryOutput {
+    /// Output entries in projection order.
+    pub columns: Vec<OutputColumn>,
+    /// Whether every entry has a stable zero-based ordinal.
+    pub ordinal_complete: bool,
+}
+
+/// One entry in a query's ordered output description.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutputColumn {
+    /// A single output column with a known name.
+    Named {
+        name: String,
+        /// The zero-based output ordinal, when knowable.
+        ordinal: Option<usize>,
+    },
+    /// A single output column whose database-provided name is not reliable.
+    Unnamed {
+        /// The zero-based output ordinal, when knowable.
+        ordinal: Option<usize>,
+    },
+    /// An unresolved wildcard that contributes an unknown number of columns.
+    Wildcard {
+        /// Optional table or source qualifier from `table.*`.
+        qualifier: Option<String>,
+        /// The first possible output ordinal, when no earlier wildcard exists.
+        #[serde(rename = "startOrdinal")]
+        start_ordinal: Option<usize>,
+    },
+}
 
 /// A node in the column lineage graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,12 +229,19 @@ pub fn lineage(
     dialect: Option<DialectType>,
     trim_selects: bool,
 ) -> Result<LineageNode> {
-    let mut owned = lineage_normalized_expression(sql);
-    // Fast path: skip clone when there are no CTEs to expand
-    if has_lineage_with_clause(&owned) {
-        expand_cte_stars(&mut owned, None);
-    }
-    lineage_from_expression(column, &owned, dialect, trim_selects)
+    let prepared = prepare_lineage_expression(sql, None, dialect, false)?;
+    lineage_from_column_ref(ColumnRef::Name(column), &prepared, dialect, trim_selects)
+}
+
+/// Build the lineage graph for the column at a zero-based output ordinal.
+pub fn lineage_at(
+    ordinal: usize,
+    sql: &Expression,
+    dialect: Option<DialectType>,
+    trim_selects: bool,
+) -> Result<LineageNode> {
+    let prepared = prepare_lineage_expression(sql, None, dialect, false)?;
+    lineage_from_column_ref(ColumnRef::Index(ordinal), &prepared, dialect, trim_selects)
 }
 
 /// Build the lineage graph for a column in a SQL query using optional schema metadata.
@@ -223,49 +266,83 @@ pub fn lineage_with_schema(
     dialect: Option<DialectType>,
     trim_selects: bool,
 ) -> Result<LineageNode> {
-    let normalized_expression = lineage_normalized_expression(sql);
-    let mut qualified_expression = if let Some(schema) = schema {
-        let options = if let Some(dialect_type) = dialect.or_else(|| schema.dialect()) {
-            QualifyColumnsOptions::new()
-                .with_dialect(dialect_type)
-                .with_allow_partial(true)
-        } else {
-            QualifyColumnsOptions::new().with_allow_partial(true)
-        };
-
-        qualify_columns(normalized_expression.clone(), schema, &options).map_err(|e| {
-            Error::internal(format!("Lineage qualification failed with schema: {}", e))
-        })?
-    } else {
-        normalized_expression
-    };
-
-    // Annotate types in-place so lineage nodes carry type information
-    annotate_types(&mut qualified_expression, schema, dialect);
-
-    // Expand CTE stars on the already-owned expression (no extra clone).
-    // Pass schema so that stars from external tables can also be resolved.
-    expand_cte_stars(&mut qualified_expression, schema);
-
-    lineage_from_expression(column, &qualified_expression, dialect, trim_selects)
+    let prepared = prepare_lineage_expression(sql, schema, dialect, true)?;
+    lineage_from_column_ref(ColumnRef::Name(column), &prepared, dialect, trim_selects)
 }
 
-fn lineage_from_expression(
-    column: &str,
+/// Build schema-aware lineage for the column at a zero-based output ordinal.
+pub fn lineage_at_with_schema(
+    ordinal: usize,
+    sql: &Expression,
+    schema: Option<&dyn Schema>,
+    dialect: Option<DialectType>,
+    trim_selects: bool,
+) -> Result<LineageNode> {
+    let prepared = prepare_lineage_expression(sql, schema, dialect, true)?;
+    lineage_from_column_ref(ColumnRef::Index(ordinal), &prepared, dialect, trim_selects)
+}
+
+/// Return the ordered output description of a query.
+pub fn output_columns(sql: &Expression, dialect: Option<DialectType>) -> Result<QueryOutput> {
+    let prepared = prepare_lineage_expression(sql, None, dialect, false)?;
+    query_output_from_expression(&prepared)
+}
+
+/// Return the ordered output description of a query after schema-aware expansion.
+pub fn output_columns_with_schema(
+    sql: &Expression,
+    schema: Option<&dyn Schema>,
+    dialect: Option<DialectType>,
+) -> Result<QueryOutput> {
+    let prepared = prepare_lineage_expression(sql, schema, dialect, true)?;
+    query_output_from_expression(&prepared)
+}
+
+fn prepare_lineage_expression(
+    sql: &Expression,
+    schema: Option<&dyn Schema>,
+    dialect: Option<DialectType>,
+    schema_aware: bool,
+) -> Result<Expression> {
+    let normalized = lineage_normalized_expression(sql);
+    let mut prepared = if schema_aware {
+        if let Some(schema) = schema {
+            let options = if let Some(dialect_type) = dialect.or_else(|| schema.dialect()) {
+                QualifyColumnsOptions::new()
+                    .with_dialect(dialect_type)
+                    .with_allow_partial(true)
+            } else {
+                QualifyColumnsOptions::new().with_allow_partial(true)
+            };
+
+            qualify_columns(normalized.clone(), schema, &options).map_err(|error| {
+                Error::internal(format!("Lineage qualification failed with schema: {error}"))
+            })?
+        } else {
+            normalized
+        }
+    } else {
+        normalized
+    };
+
+    if schema_aware {
+        annotate_types(&mut prepared, schema, dialect);
+        expand_cte_stars(&mut prepared, schema);
+    } else if has_lineage_with_clause(&prepared) {
+        expand_cte_stars(&mut prepared, None);
+    }
+
+    Ok(prepared)
+}
+
+fn lineage_from_column_ref(
+    column: ColumnRef<'_>,
     sql: &Expression,
     dialect: Option<DialectType>,
     trim_selects: bool,
 ) -> Result<LineageNode> {
     let scope = build_scope(sql);
-    to_node(
-        ColumnRef::Name(column),
-        scope,
-        dialect,
-        "",
-        "",
-        "",
-        trim_selects,
-    )
+    to_node(column, scope, dialect, "", "", "", trim_selects)
 }
 
 #[cfg(feature = "generate")]
@@ -275,15 +352,11 @@ pub(crate) fn lineage_by_index_from_expression(
     dialect: Option<DialectType>,
     trim_selects: bool,
 ) -> Result<LineageNode> {
-    let normalized = lineage_normalized_expression(sql);
-    let scope = build_scope(&normalized);
-    to_node(
+    let prepared = prepare_lineage_expression(sql, None, dialect, false)?;
+    lineage_from_column_ref(
         ColumnRef::Index(column_index),
-        scope,
+        &prepared,
         dialect,
-        "",
-        "",
-        "",
         trim_selects,
     )
 }
@@ -1256,9 +1329,12 @@ fn handle_set_operation(
     depth: usize,
 ) -> Result<LineageNode> {
     let scope = context.scope(scope_id);
+    let trace_wildcard_by_name =
+        matches!(column, ColumnRef::Name(name) if normalize_column_name(name, dialect) == "*");
 
     // Determine column index
     let col_index = match column {
+        ColumnRef::Name(_) if trace_wildcard_by_name => 0,
         ColumnRef::Name(name) => column_to_index(scope_expr, name, dialect)?,
         ColumnRef::Index(i) => *i,
     };
@@ -1281,10 +1357,22 @@ fn handle_set_operation(
         apply_scope_context(&mut node, scope, source_name, reference_node_name);
     }
 
-    // Recurse into each union branch
+    let mut resolution_failure = None;
+
+    // Recurse into each set-operation branch. Resolution failures are branch-local,
+    // but genuine parser/internal errors must not be silently discarded.
     for &branch_scope_id in &context.indexed(scope_id).union_scopes {
-        if let Ok(child) = to_node_inner(
-            ColumnRef::Index(col_index),
+        let branch_column = if trace_wildcard_by_name {
+            match column {
+                ColumnRef::Name(name) => ColumnRef::Name(name),
+                ColumnRef::Index(_) => unreachable!("wildcard tracing is name-based"),
+            }
+        } else {
+            ColumnRef::Index(col_index)
+        };
+
+        match to_node_inner(
+            branch_column,
             context,
             branch_scope_id,
             dialect,
@@ -1295,11 +1383,41 @@ fn handle_set_operation(
             ancestor_cte_scopes,
             depth + 1,
         ) {
-            node.downstream.push(child);
+            Ok(child) => node.downstream.push(child),
+            Err(Error::ColumnResolution { reason, .. }) => {
+                resolution_failure = Some(merge_resolution_reason(resolution_failure, reason));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if node.downstream.is_empty() {
+        if let Some(reason) = resolution_failure {
+            let target = match column {
+                ColumnRef::Name(name) => ColumnResolutionTarget::Name {
+                    name: name.to_string(),
+                },
+                ColumnRef::Index(ordinal) => ColumnResolutionTarget::Ordinal { ordinal: *ordinal },
+            };
+            return Err(column_resolution_error(target, reason));
         }
     }
 
     Ok(node)
+}
+
+fn merge_resolution_reason(
+    current: Option<ColumnResolutionReason>,
+    candidate: ColumnResolutionReason,
+) -> ColumnResolutionReason {
+    match (current, candidate) {
+        (Some(ColumnResolutionReason::Ambiguous), _) | (_, ColumnResolutionReason::Ambiguous) => {
+            ColumnResolutionReason::Ambiguous
+        }
+        (Some(ColumnResolutionReason::Indeterminate), _)
+        | (_, ColumnResolutionReason::Indeterminate) => ColumnResolutionReason::Indeterminate,
+        _ => ColumnResolutionReason::NotFound,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2415,6 +2533,262 @@ fn non_virtual_source_names_from_from_join(scope: &Scope) -> Vec<String> {
 // Helper functions
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
+struct OutputLayoutEntry {
+    column: OutputColumn,
+    projection_index: usize,
+}
+
+fn query_output_from_expression(expression: &Expression) -> Result<QueryOutput> {
+    let select = leftmost_output_select(expression).ok_or_else(|| {
+        Error::invalid_input("output_columns requires a SELECT or set-operation query")
+    })?;
+    let entries = output_layout(select);
+    let ordinal_complete = !entries
+        .iter()
+        .any(|entry| matches!(entry.column, OutputColumn::Wildcard { .. }));
+
+    Ok(QueryOutput {
+        columns: entries.into_iter().map(|entry| entry.column).collect(),
+        ordinal_complete,
+    })
+}
+
+fn leftmost_output_select(expression: &Expression) -> Option<&Select> {
+    match expression {
+        Expression::Select(select) => Some(select),
+        Expression::Union(set_op) => leftmost_output_select(&set_op.left),
+        Expression::Intersect(set_op) => leftmost_output_select(&set_op.left),
+        Expression::Except(set_op) => leftmost_output_select(&set_op.left),
+        Expression::Subquery(subquery) => leftmost_output_select(&subquery.this),
+        Expression::Cte(cte) => leftmost_output_select(&cte.this),
+        Expression::Paren(paren) => leftmost_output_select(&paren.this),
+        _ => None,
+    }
+}
+
+fn output_layout(select: &Select) -> Vec<OutputLayoutEntry> {
+    let mut entries = Vec::new();
+    let mut next_ordinal = Some(0usize);
+
+    for (projection_index, projection) in select.expressions.iter().enumerate() {
+        let projection = unwrap_output_annotation(projection);
+
+        if let Some(qualifier) = output_wildcard_qualifier(projection) {
+            entries.push(OutputLayoutEntry {
+                column: OutputColumn::Wildcard {
+                    qualifier,
+                    start_ordinal: next_ordinal,
+                },
+                projection_index,
+            });
+            next_ordinal = None;
+            continue;
+        }
+
+        if let Expression::Aliases(aliases) = projection {
+            if !aliases.expressions.is_empty() {
+                for alias in &aliases.expressions {
+                    let ordinal = take_output_ordinal(&mut next_ordinal);
+                    let column = get_alias_or_name(alias)
+                        .map(|name| OutputColumn::Named { name, ordinal })
+                        .unwrap_or(OutputColumn::Unnamed { ordinal });
+                    entries.push(OutputLayoutEntry {
+                        column,
+                        projection_index,
+                    });
+                }
+                continue;
+            }
+        }
+
+        let ordinal = take_output_ordinal(&mut next_ordinal);
+        let column = get_alias_or_name(projection)
+            .map(|name| OutputColumn::Named { name, ordinal })
+            .unwrap_or(OutputColumn::Unnamed { ordinal });
+        entries.push(OutputLayoutEntry {
+            column,
+            projection_index,
+        });
+    }
+
+    entries
+}
+
+fn take_output_ordinal(next_ordinal: &mut Option<usize>) -> Option<usize> {
+    let ordinal = *next_ordinal;
+    if let Some(value) = ordinal {
+        *next_ordinal = Some(value + 1);
+    }
+    ordinal
+}
+
+fn unwrap_output_annotation(mut expression: &Expression) -> &Expression {
+    while let Expression::Annotated(annotated) = expression {
+        expression = &annotated.this;
+    }
+    expression
+}
+
+/// Return `Some(qualifier)` for a wildcard, where the inner option is the qualifier.
+fn output_wildcard_qualifier(expression: &Expression) -> Option<Option<String>> {
+    match expression {
+        Expression::Star(star) => Some(star.table.as_ref().map(|table| table.name.clone())),
+        Expression::Column(column) if column.name.name == "*" => {
+            Some(column.table.as_ref().map(|table| table.name.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn column_resolution_error(
+    target: ColumnResolutionTarget,
+    reason: ColumnResolutionReason,
+) -> Error {
+    Error::column_resolution(target, reason)
+}
+
+fn name_resolution_error(name: &str, reason: ColumnResolutionReason) -> Error {
+    column_resolution_error(
+        ColumnResolutionTarget::Name {
+            name: name.to_string(),
+        },
+        reason,
+    )
+}
+
+fn ordinal_resolution_error(ordinal: usize, reason: ColumnResolutionReason) -> Error {
+    column_resolution_error(ColumnResolutionTarget::Ordinal { ordinal }, reason)
+}
+
+fn find_select_expr_by_name(
+    select: &Select,
+    name: &str,
+    dialect: Option<DialectType>,
+) -> Result<Expression> {
+    let normalized_name = normalize_column_name(name, dialect);
+    let layout = output_layout(select);
+    let mut matches = Vec::new();
+
+    for entry in &layout {
+        let is_match = match &entry.column {
+            OutputColumn::Named {
+                name: output_name, ..
+            } => normalize_column_name(output_name, dialect) == normalized_name,
+            OutputColumn::Wildcard { .. } => normalized_name == "*",
+            OutputColumn::Unnamed { .. } => false,
+        };
+        if is_match {
+            matches.push(entry.projection_index);
+        }
+    }
+    match matches.as_slice() {
+        [projection_index] => return Ok(select.expressions[*projection_index].clone()),
+        [_, ..] => {
+            return Err(name_resolution_error(
+                name,
+                ColumnResolutionReason::Ambiguous,
+            ))
+        }
+        [] => {}
+    }
+
+    if let Some(expression) = synthesize_star_passthrough_expr(select, name) {
+        return Ok(expression);
+    }
+
+    let reason = if layout
+        .iter()
+        .any(|entry| matches!(entry.column, OutputColumn::Wildcard { .. }))
+    {
+        ColumnResolutionReason::Indeterminate
+    } else {
+        ColumnResolutionReason::NotFound
+    };
+    Err(name_resolution_error(name, reason))
+}
+
+fn find_select_expr_by_ordinal(select: &Select, ordinal: usize) -> Result<Expression> {
+    let layout = output_layout(select);
+
+    for entry in &layout {
+        match &entry.column {
+            OutputColumn::Named {
+                ordinal: Some(candidate),
+                ..
+            }
+            | OutputColumn::Unnamed {
+                ordinal: Some(candidate),
+            } if *candidate == ordinal => {
+                return Ok(select.expressions[entry.projection_index].clone())
+            }
+            OutputColumn::Wildcard { start_ordinal, .. } => {
+                if match start_ordinal {
+                    Some(start) => ordinal >= *start,
+                    None => true,
+                } {
+                    return Err(ordinal_resolution_error(
+                        ordinal,
+                        ColumnResolutionReason::Indeterminate,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Err(ordinal_resolution_error(
+        ordinal,
+        ColumnResolutionReason::NotFound,
+    ))
+}
+
+fn output_name_to_ordinal(
+    expression: &Expression,
+    name: &str,
+    dialect: Option<DialectType>,
+) -> Result<usize> {
+    let select = leftmost_output_select(expression).ok_or_else(|| {
+        Error::invalid_input("column resolution requires a SELECT or set-operation query")
+    })?;
+    let normalized_name = normalize_column_name(name, dialect);
+    let layout = output_layout(select);
+    let mut matches = Vec::new();
+
+    for entry in &layout {
+        if let OutputColumn::Named {
+            name: output_name,
+            ordinal,
+        } = &entry.column
+        {
+            if normalize_column_name(output_name, dialect) == normalized_name {
+                matches.push(*ordinal);
+            }
+        }
+    }
+
+    if matches.len() > 1 {
+        return Err(name_resolution_error(
+            name,
+            ColumnResolutionReason::Ambiguous,
+        ));
+    }
+    if let Some(ordinal) = matches.into_iter().next() {
+        return ordinal
+            .ok_or_else(|| name_resolution_error(name, ColumnResolutionReason::Indeterminate));
+    }
+
+    let reason = if layout
+        .iter()
+        .any(|entry| matches!(entry.column, OutputColumn::Wildcard { .. }))
+    {
+        ColumnResolutionReason::Indeterminate
+    } else {
+        ColumnResolutionReason::NotFound
+    };
+    Err(name_resolution_error(name, reason))
+}
+
 /// Get the alias or name of an expression
 fn get_alias_or_name(expr: &Expression) -> Option<String> {
     match expr {
@@ -2471,37 +2845,12 @@ fn find_select_expr(
 ) -> Result<Expression> {
     if let Expression::Select(ref select) = scope_expr {
         match column {
-            ColumnRef::Name(name) => {
-                let normalized_name = normalize_column_name(name, dialect);
-                for expr in &select.expressions {
-                    if let Some(alias_or_name) = get_alias_or_name(expr) {
-                        if normalize_column_name(&alias_or_name, dialect) == normalized_name {
-                            return Ok(expr.clone());
-                        }
-                    }
-                }
-                if let Some(expr) = synthesize_star_passthrough_expr(select, name) {
-                    return Ok(expr);
-                }
-                Err(crate::error::Error::parse(
-                    format!("Cannot find column '{}' in query", name),
-                    0,
-                    0,
-                    0,
-                    0,
-                ))
-            }
-            ColumnRef::Index(idx) => select.expressions.get(*idx).cloned().ok_or_else(|| {
-                crate::error::Error::parse(format!("Column index {} out of range", idx), 0, 0, 0, 0)
-            }),
+            ColumnRef::Name(name) => find_select_expr_by_name(select, name, dialect),
+            ColumnRef::Index(ordinal) => find_select_expr_by_ordinal(select, *ordinal),
         }
     } else {
-        Err(crate::error::Error::parse(
-            "Expected SELECT expression for column lookup",
-            0,
-            0,
-            0,
-            0,
+        Err(Error::invalid_input(
+            "column resolution requires a SELECT expression",
         ))
     }
 }
@@ -2609,43 +2958,7 @@ fn column_to_index(
     name: &str,
     dialect: Option<DialectType>,
 ) -> Result<usize> {
-    let normalized_name = normalize_column_name(name, dialect);
-    let mut expr = set_op_expr;
-    loop {
-        match expr {
-            Expression::Union(u) => expr = &u.left,
-            Expression::Intersect(i) => expr = &i.left,
-            Expression::Except(e) => expr = &e.left,
-            Expression::Subquery(subquery) => expr = &subquery.this,
-            Expression::Cte(cte) => expr = &cte.this,
-            Expression::Paren(paren) => expr = &paren.this,
-            Expression::Select(select) => {
-                for (i, e) in select.expressions.iter().enumerate() {
-                    if let Some(alias_or_name) = get_alias_or_name(e) {
-                        if normalize_column_name(&alias_or_name, dialect) == normalized_name {
-                            return Ok(i);
-                        }
-                    }
-                }
-                return Err(crate::error::Error::parse(
-                    format!("Cannot find column '{}' in set operation", name),
-                    0,
-                    0,
-                    0,
-                    0,
-                ));
-            }
-            _ => {
-                return Err(crate::error::Error::parse(
-                    "Expected SELECT or set operation",
-                    0,
-                    0,
-                    0,
-                    0,
-                ))
-            }
-        }
-    }
+    output_name_to_ordinal(set_op_expr, name, dialect)
 }
 
 fn normalize_column_name(name: &str, dialect: Option<DialectType>) -> String {
@@ -5086,6 +5399,218 @@ FROM t JOIN UNNEST(t.items) AS item ON TRUE
 
         // UNION branches should be traced by index
         assert_eq!(node.downstream.len(), 2);
+    }
+
+    #[test]
+    fn test_issue_384_output_columns_preserve_unknown_positions() {
+        let expr = parse("SELECT a, 1, *, tail FROM unknown_source");
+        let output = output_columns(&expr, None).expect("output columns");
+
+        assert!(!output.ordinal_complete);
+        assert_eq!(
+            output.columns,
+            vec![
+                OutputColumn::Named {
+                    name: "a".to_string(),
+                    ordinal: Some(0),
+                },
+                OutputColumn::Unnamed { ordinal: Some(1) },
+                OutputColumn::Wildcard {
+                    qualifier: None,
+                    start_ordinal: Some(2),
+                },
+                OutputColumn::Named {
+                    name: "tail".to_string(),
+                    ordinal: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_issue_384_output_columns_use_leftmost_set_operation_branch() {
+        let expr = parse(
+            "SELECT * FROM unknown_source UNION ALL \
+             SELECT known_first AS x, known_second AS y FROM known_source",
+        );
+        let output = output_columns(&expr, None).expect("output columns");
+
+        assert!(!output.ordinal_complete);
+        assert_eq!(
+            output.columns,
+            vec![OutputColumn::Wildcard {
+                qualifier: None,
+                start_ordinal: Some(0),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_issue_384_schema_expands_output_wildcard() {
+        let expr = parse("SELECT * FROM unknown_source");
+        let mut schema = MappingSchema::new();
+        schema
+            .add_table(
+                "unknown_source",
+                &[
+                    ("first_col".to_string(), DataType::Text),
+                    ("second_col".to_string(), DataType::Text),
+                ],
+                None,
+            )
+            .expect("schema setup");
+
+        let output = output_columns_with_schema(&expr, Some(&schema), None)
+            .expect("schema-aware output columns");
+        assert!(output.ordinal_complete);
+        assert_eq!(
+            output.columns,
+            vec![
+                OutputColumn::Named {
+                    name: "first_col".to_string(),
+                    ordinal: Some(0),
+                },
+                OutputColumn::Named {
+                    name: "second_col".to_string(),
+                    ordinal: Some(1),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_issue_383_lineage_at_traces_resolvable_set_operation_branch() {
+        let expr = parse(
+            "SELECT * FROM unknown_source UNION ALL \
+             SELECT known_first AS x, known_second AS y FROM known_source",
+        );
+        let node = lineage_at(1, &expr, None, false).expect("ordinal lineage");
+
+        assert_lineage_contains(&node, "known_source.known_second");
+        assert_eq!(node.downstream.len(), 1);
+    }
+
+    #[test]
+    fn test_issue_383_unresolved_wildcard_does_not_shift_ordinal() {
+        let expr = parse(
+            "SELECT *, tail FROM unknown_source UNION ALL \
+             SELECT known_first, known_second FROM known_source",
+        );
+        let node = lineage_at(1, &expr, None, false).expect("partial ordinal lineage");
+        let names = lineage_names(&node);
+
+        assert!(names.iter().any(|name| name == "known_source.known_second"));
+        assert!(!names
+            .iter()
+            .any(|name| name.ends_with(".tail") || name == "tail"));
+    }
+
+    #[test]
+    fn test_issue_383_lineage_at_ignores_branch_output_names() {
+        let expr = parse(
+            "SELECT left_value AS left_name FROM left_source UNION ALL \
+             SELECT right_value AS right_name FROM right_source",
+        );
+        let node = lineage_at(0, &expr, None, false).expect("ordinal lineage");
+
+        assert_lineage_contains(&node, "left_source.left_value");
+        assert_lineage_contains(&node, "right_source.right_value");
+    }
+
+    #[test]
+    fn test_issue_383_lineage_at_supports_all_set_operations() {
+        for operator in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+            let expr = parse(&format!(
+                "SELECT left_value AS left_name FROM left_source {operator} \
+                 SELECT right_value AS right_name FROM right_source"
+            ));
+            let node = lineage_at(0, &expr, None, false).expect("ordinal lineage");
+            assert_eq!(
+                node.downstream.len(),
+                2,
+                "expected both branches for {operator}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_issue_383_lineage_at_with_schema_expands_wildcard() {
+        let expr = parse(
+            "SELECT * FROM unknown_source UNION ALL \
+             SELECT known_first, known_second FROM known_source",
+        );
+        let mut schema = MappingSchema::new();
+        schema
+            .add_table(
+                "unknown_source",
+                &[
+                    ("first_col".to_string(), DataType::Text),
+                    ("second_col".to_string(), DataType::Text),
+                ],
+                None,
+            )
+            .expect("schema setup");
+        schema
+            .add_table(
+                "known_source",
+                &[
+                    ("known_first".to_string(), DataType::Text),
+                    ("known_second".to_string(), DataType::Text),
+                ],
+                None,
+            )
+            .expect("schema setup");
+
+        let node = lineage_at_with_schema(1, &expr, Some(&schema), None, false)
+            .expect("schema-aware ordinal lineage");
+        assert_lineage_contains(&node, "unknown_source.second_col");
+        assert_lineage_contains(&node, "known_source.known_second");
+    }
+
+    #[test]
+    fn test_issue_385_structured_lineage_resolution_errors() {
+        let out_of_range = lineage_at(1, &parse("SELECT a FROM t"), None, false)
+            .expect_err("ordinal should be out of range");
+        assert!(matches!(
+            out_of_range,
+            Error::ColumnResolution {
+                target: ColumnResolutionTarget::Ordinal { ordinal: 1 },
+                reason: ColumnResolutionReason::NotFound,
+            }
+        ));
+
+        let indeterminate = lineage(
+            "tail",
+            &parse(
+                "SELECT *, tail FROM unknown_source UNION ALL \
+                 SELECT known_first, known_second FROM known_source",
+            ),
+            None,
+            false,
+        )
+        .expect_err("tail ordinal should be indeterminate");
+        assert!(matches!(
+            indeterminate,
+            Error::ColumnResolution {
+                target: ColumnResolutionTarget::Name { ref name },
+                reason: ColumnResolutionReason::Indeterminate,
+            } if name == "tail"
+        ));
+
+        let ambiguous = lineage(
+            "duplicate",
+            &parse("SELECT a AS duplicate, b AS duplicate FROM t"),
+            None,
+            false,
+        )
+        .expect_err("duplicate output name should be ambiguous");
+        assert!(matches!(
+            ambiguous,
+            Error::ColumnResolution {
+                target: ColumnResolutionTarget::Name { ref name },
+                reason: ColumnResolutionReason::Ambiguous,
+            } if name == "duplicate"
+        ));
     }
 
     // --- Tests for column lineage inside function calls (issue #18) ---

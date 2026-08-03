@@ -172,6 +172,10 @@ currently produces `columnLineage` dataset facets, optional schema facets, and
 `JobEvent` / `RunEvent` payloads for supported query shapes such as `SELECT`,
 `INSERT ... SELECT`, and `CREATE TABLE AS SELECT`.
 
+Lineage can be selected by output name or by zero-based output ordinal. Ordered
+output metadata preserves unnamed projections and unresolved wildcards, so
+callers can decide whether a positional lookup is complete before tracing it.
+
 OpenLineage transport and client emission are intentionally out of scope:
 Polyglot builds payloads for callers to inspect, persist, or send through their
 own infrastructure.
@@ -277,7 +281,7 @@ If you want to disable `stacker` for a native Rust build, turn off default featu
 
 ```toml
 [dependencies]
-polyglot-sql = { version = "0.6.3", default-features = false, features = ["all-dialects", "transpile"] }
+polyglot-sql = { version = "0.7.0", default-features = false, features = ["all-dialects", "transpile"] }
 ```
 
 That can reduce overhead slightly on trusted inputs, but you lose the default stack-growth protection for deeply nested SQL.

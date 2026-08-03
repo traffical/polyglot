@@ -24,10 +24,10 @@
 # =============================================================================
 
 SQLGLOT_REPO := https://github.com/tobymao/sqlglot.git
-SQLGLOT_REF := v30.12.0
+SQLGLOT_REF := v30.14.0
 
 CLICKHOUSE_REPO := https://github.com/ClickHouse/ClickHouse.git
-CLICKHOUSE_REF := v26.6.1.1193-stable
+CLICKHOUSE_REF := v26.7.1.1315-stable
 
 PYTHON_RELEASE_PROFILE := python_release
 PYTHON_BENCH_BUILD_ENV := MATURIN_PEP517_ARGS="--profile $(PYTHON_RELEASE_PROFILE)"
@@ -498,19 +498,19 @@ build-ffi-static:
 
 # Build Python extension in development mode (uv-managed)
 develop-python:
-	cd crates/polyglot-sql-python && uv sync --group dev && uv run maturin develop
+	cd crates/polyglot-sql-python && uv sync --group dev --no-install-project && uv run --no-sync maturin develop
 
 # Run Python tests
 test-python:
-	cd crates/polyglot-sql-python && uv sync --group dev && uv run pytest
+	cd crates/polyglot-sql-python && uv sync --group dev --reinstall-package polyglot-sql && uv run --no-sync pytest
 
 # Build Python wheels (release)
 build-python:
-	cd crates/polyglot-sql-python && uv sync --group dev && uv run maturin build --profile $(PYTHON_RELEASE_PROFILE)
+	cd crates/polyglot-sql-python && uv sync --group dev --no-install-project && uv run --no-sync maturin build --profile $(PYTHON_RELEASE_PROFILE)
 
 # Type-check Python package/stubs
 typecheck-python:
-	cd crates/polyglot-sql-python && uv sync --group dev && uv run pyright python/polyglot_sql/
+	cd crates/polyglot-sql-python && uv sync --group dev --reinstall-package polyglot-sql && uv run --no-sync pyright python/polyglot_sql/
 
 # Generate C header via build.rs/cbindgen
 generate-ffi-header:

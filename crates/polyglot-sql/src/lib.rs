@@ -79,7 +79,7 @@ pub use ast_transforms::{
 pub use dialects::{unregister_custom_dialect, CustomDialectBuilder, Dialect, DialectType};
 #[cfg(feature = "transpile")]
 pub use dialects::{TranspileOptions, TranspileTarget};
-pub use error::{Error, Result};
+pub use error::{ColumnResolutionReason, ColumnResolutionTarget, Error, Result};
 #[cfg(feature = "semantic")]
 pub use error::{ValidationError, ValidationResult, ValidationSeverity};
 pub use expressions::{DataType, Expression};
@@ -94,6 +94,11 @@ pub use guard::ComplexityGuardOptions;
 pub use helper::{
     csv, find_new_name, is_date_unit, is_float, is_int, is_iso_date, is_iso_datetime, merge_ranges,
     name_sequence, seq_get, split_num_words, tsort, while_changing, DATE_UNITS,
+};
+#[cfg(feature = "semantic")]
+pub use lineage::{
+    lineage, lineage_at, lineage_at_with_schema, lineage_with_schema, output_columns,
+    output_columns_with_schema, LineageNode, OutputColumn, QueryOutput,
 };
 #[cfg(feature = "semantic")]
 pub use optimizer::{
@@ -858,7 +863,11 @@ mod api_contract_tests {
             },
             "lineage" => {
                 "lineage.lineage" => lineage::lineage,
+                "lineage.lineage_at" => lineage::lineage_at,
+                "lineage.lineage_at_with_schema" => lineage::lineage_at_with_schema,
                 "lineage.lineage_with_schema" => lineage::lineage_with_schema,
+                "lineage.output_columns" => lineage::output_columns,
+                "lineage.output_columns_with_schema" => lineage::output_columns_with_schema,
                 "lineage.get_source_tables" => lineage::get_source_tables
             },
             "openlineage" => {

@@ -23,6 +23,78 @@ pub(super) fn normalize_root(expression: Expression, context: &NormalizationCont
     let source = context.source;
     let target = context.target;
     let expr = expression;
+
+    // PostgreSQL set-returning GENERATE_SERIES calls in the projection become
+    // BigQuery UNNEST sources, preserving their projection aliases.
+    let expr = if matches!(source, DialectType::PostgreSQL | DialectType::Redshift)
+        && matches!(target, DialectType::BigQuery)
+    {
+        if let Expression::Select(mut select) = expr {
+            let mut generated_sources = Vec::new();
+            for projection in &mut select.expressions {
+                let generated = match projection {
+                    Expression::Alias(alias) => match &alias.this {
+                        Expression::Function(function)
+                            if function.name.eq_ignore_ascii_case("GENERATE_SERIES") =>
+                        {
+                            Some((function.as_ref().clone(), alias.alias.clone()))
+                        }
+                        _ => None,
+                    },
+                    Expression::Function(function)
+                        if function.name.eq_ignore_ascii_case("GENERATE_SERIES") =>
+                    {
+                        Some((
+                            function.as_ref().clone(),
+                            Identifier::new("_gen_series_value"),
+                        ))
+                    }
+                    _ => None,
+                };
+
+                if let Some((function, alias)) = generated {
+                    *projection = Expression::column(alias.name.clone());
+                    generated_sources.push(Expression::Unnest(Box::new(UnnestFunc {
+                        this: Expression::Function(Box::new(function)),
+                        expressions: Vec::new(),
+                        with_ordinality: false,
+                        alias: Some(alias),
+                        offset_alias: None,
+                        inferred_type: None,
+                    })));
+                }
+            }
+
+            for generated_source in generated_sources {
+                if select.from.is_none() {
+                    select.from = Some(From {
+                        expressions: vec![generated_source],
+                    });
+                } else {
+                    select.joins.push(Join {
+                        this: generated_source,
+                        on: None,
+                        using: Vec::new(),
+                        kind: JoinKind::Cross,
+                        use_inner_keyword: false,
+                        use_outer_keyword: false,
+                        deferred_condition: false,
+                        join_hint: None,
+                        match_condition: None,
+                        pivots: Vec::new(),
+                        comments: Vec::new(),
+                        nesting_group: 0,
+                        directed: false,
+                    });
+                }
+            }
+            Expression::Select(select)
+        } else {
+            expr
+        }
+    } else {
+        expr
+    };
     // Handle SELECT INTO -> CREATE TABLE AS for DuckDB/Snowflake/etc.
     let expr = if matches!(source, DialectType::TSQL | DialectType::Fabric) {
         transform_select_into(expr, source, target)
@@ -213,6 +285,22 @@ pub(super) fn normalize_root(expression: Expression, context: &NormalizationCont
             }
         }
 
+        // Databricks TIMESTAMP is timezone-aware when written to DuckDB.
+        if matches!(source, DialectType::Databricks) && matches!(target, DialectType::DuckDB) {
+            for col in &mut ct.columns {
+                if let DataType::Timestamp {
+                    precision,
+                    timezone: false,
+                } = col.data_type
+                {
+                    col.data_type = DataType::Timestamp {
+                        precision,
+                        timezone: true,
+                    };
+                }
+            }
+        }
+
         // Spark/Databricks: INTEGER -> INT in column definitions
         // Python sqlglot always outputs INT for Spark/Databricks
         if matches!(target, DialectType::Spark | DialectType::Databricks) {
@@ -363,6 +451,58 @@ pub(super) fn normalize_root(expression: Expression, context: &NormalizationCont
         } else {
             expr
         }
+    } else {
+        expr
+    };
+
+    // Recursive CTE anchors written as bare VALUES need a SELECT wrapper when
+    // they are the left side of a UNION.
+    let expr = if let Expression::Select(mut select) = expr {
+        if let Some(ref mut with) = select.with {
+            for cte in &mut with.ctes {
+                if let Expression::Union(ref mut union) = cte.this {
+                    if let Expression::Values(ref values) = union.left {
+                        let source = if matches!(target, DialectType::Presto) {
+                            Expression::Subquery(Box::new(Subquery {
+                                this: Expression::Values(values.clone()),
+                                alias: Some(Identifier::new("_values")),
+                                column_aliases: Vec::new(),
+                                alias_explicit_as: false,
+                                alias_keyword: None,
+                                order_by: None,
+                                limit: None,
+                                offset: None,
+                                distribute_by: None,
+                                sort_by: None,
+                                cluster_by: None,
+                                lateral: false,
+                                modifiers_inside: false,
+                                trailing_comments: Vec::new(),
+                                inferred_type: None,
+                            }))
+                        } else {
+                            let mut values = values.as_ref().clone();
+                            values.alias = Some(Identifier::new("_values"));
+                            Expression::Values(Box::new(values))
+                        };
+                        let mut anchor = Select::new();
+                        anchor.expressions = vec![Expression::Star(Star {
+                            table: None,
+                            except: None,
+                            replace: None,
+                            rename: None,
+                            trailing_comments: Vec::new(),
+                            span: None,
+                        })];
+                        anchor.from = Some(From {
+                            expressions: vec![source],
+                        });
+                        union.left = Expression::Select(Box::new(anchor));
+                    }
+                }
+            }
+        }
+        Expression::Select(select)
     } else {
         expr
     };

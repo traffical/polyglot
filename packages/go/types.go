@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.6.3"
+const sdkVersion = "0.7.0"
 
 func Version() string {
 	return sdkVersion
@@ -120,6 +120,29 @@ type LineageNode struct {
 	SourceKind        string          `json:"source_kind"`
 	SourceAlias       *string         `json:"source_alias,omitempty"`
 	ReferenceNodeName string          `json:"reference_node_name"`
+}
+
+type OutputColumnKind string
+
+const (
+	OutputColumnNamed    OutputColumnKind = "named"
+	OutputColumnUnnamed  OutputColumnKind = "unnamed"
+	OutputColumnWildcard OutputColumnKind = "wildcard"
+)
+
+// OutputColumn describes one projection slot. Fields that do not apply to the
+// selected Kind are nil.
+type OutputColumn struct {
+	Kind         OutputColumnKind `json:"kind"`
+	Name         *string          `json:"name,omitempty"`
+	Ordinal      *int             `json:"ordinal"`
+	Qualifier    *string          `json:"qualifier,omitempty"`
+	StartOrdinal *int             `json:"startOrdinal,omitempty"`
+}
+
+type QueryOutput struct {
+	Columns         []OutputColumn `json:"columns"`
+	OrdinalComplete bool           `json:"ordinalComplete"`
 }
 
 type QueryAnalysis struct {

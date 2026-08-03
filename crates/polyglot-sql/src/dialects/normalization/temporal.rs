@@ -1882,6 +1882,13 @@ pub(super) fn rewrite(
                             ))));
                         }
                     };
+                    let fmt = if matches!(source, DialectType::Generic)
+                        && matches!(target, DialectType::BigQuery)
+                    {
+                        fmt.replace("%Y-%m-%d", "%F").replace("%H:%M:%S", "%T")
+                    } else {
+                        fmt
+                    };
                     Ok(Expression::TimeToStr(Box::new(
                         crate::expressions::TimeToStr {
                             this: Box::new(this),
@@ -2190,6 +2197,15 @@ pub(super) fn rewrite(
                                         inferred_type: None,
                                     })))
                                 }
+                                DialectType::Spark | DialectType::Databricks => {
+                                    let java_fmt = crate::generator::Generator::strftime_to_java_format_non_padded_static(
+                                        fmt_str.as_deref().unwrap_or(default_date),
+                                    );
+                                    Ok(Expression::Function(Box::new(Function::new(
+                                        "TO_DATE".to_string(),
+                                        vec![this, Expression::string(java_fmt)],
+                                    ))))
+                                }
                                 _ => {
                                     // Others: TsOrDsToDate (delegates to generator)
                                     Ok(Expression::TsOrDsToDate(Box::new(
@@ -2219,9 +2235,7 @@ pub(super) fn rewrite(
                                 DialectType::Hive => {
                                     // Hive: CAST(FROM_UNIXTIME(UNIX_TIMESTAMP(x, java_fmt)) AS DATE)
                                     let java_fmt =
-                                        crate::generator::Generator::strftime_to_java_format_static(
-                                            &fmt,
-                                        );
+                                        crate::generator::Generator::strftime_to_java_format_non_padded_static(&fmt);
                                     let unix_ts = Expression::Function(Box::new(Function::new(
                                         "UNIX_TIMESTAMP".to_string(),
                                         vec![this, Expression::string(&java_fmt)],
@@ -2243,9 +2257,7 @@ pub(super) fn rewrite(
                                 DialectType::Spark | DialectType::Databricks => {
                                     // Spark: TO_DATE(x, java_fmt)
                                     let java_fmt =
-                                        crate::generator::Generator::strftime_to_java_format_static(
-                                            &fmt,
-                                        );
+                                        crate::generator::Generator::strftime_to_java_format_non_padded_static(&fmt);
                                     Ok(Expression::Function(Box::new(Function::new(
                                         "TO_DATE".to_string(),
                                         vec![this, Expression::string(&java_fmt)],

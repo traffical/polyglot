@@ -2,11 +2,62 @@ use super::{normalize, operators, temporal, types, NormalizationContext, Rewrite
 use crate::dialects::{
     duckdb_to_bigquery_format, duckdb_to_presto_format, is_default_presto_date_format,
     is_default_presto_timestamp_format, normalize_presto_format, presto_to_bigquery_format,
-    presto_to_duckdb_format, presto_to_java_format, Dialect, DialectType,
+    presto_to_duckdb_format, presto_to_java_format, presto_to_java_parse_format, Dialect,
+    DialectType,
 };
 use crate::error::Result;
 use crate::expressions::*;
 use crate::generator::Generator;
+
+fn java_to_strptime_format(fmt: &str) -> String {
+    let mut result = String::new();
+    let mut i = 0;
+    while i < fmt.len() {
+        let remaining = &fmt[i..];
+        let (replacement, consumed) = if remaining.starts_with("yyyy") {
+            (Some("%Y"), 4)
+        } else if remaining.starts_with("SSSSSS") {
+            (Some("%f"), 6)
+        } else if remaining.starts_with("EEEE") {
+            (Some("%W"), 4)
+        } else if remaining.starts_with("MM") {
+            (Some("%m"), 2)
+        } else if remaining.starts_with("dd") {
+            (Some("%d"), 2)
+        } else if remaining.starts_with("HH") {
+            (Some("%H"), 2)
+        } else if remaining.starts_with("mm") {
+            (Some("%M"), 2)
+        } else if remaining.starts_with("ss") {
+            (Some("%S"), 2)
+        } else if remaining.starts_with("yy") {
+            (Some("%y"), 2)
+        } else if remaining.starts_with('M') {
+            (Some("%-m"), 1)
+        } else if remaining.starts_with('d') {
+            (Some("%-d"), 1)
+        } else if remaining.starts_with('H') {
+            (Some("%-H"), 1)
+        } else if remaining.starts_with('m') {
+            (Some("%-M"), 1)
+        } else if remaining.starts_with('s') {
+            (Some("%-S"), 1)
+        } else if remaining.starts_with('z') {
+            (Some("%Z"), 1)
+        } else if remaining.starts_with('Z') {
+            (Some("%z"), 1)
+        } else {
+            (None, 1)
+        };
+        if let Some(replacement) = replacement {
+            result.push_str(replacement);
+        } else {
+            result.push(remaining.chars().next().unwrap());
+        }
+        i += consumed;
+    }
+    result
+}
 
 #[derive(Debug)]
 pub(super) enum Action {
@@ -1884,7 +1935,7 @@ pub(super) fn rewrite(
                             }
                         }
                         // Presto/Trino ISO-8601 helpers become casts outside Presto-family targets.
-                        "FROM_ISO8601_TIMESTAMP"
+                        "FROM_ISO8601_TIMESTAMP" | "FROM_ISO8601_TIMESTAMP_NANOS"
                             if matches!(
                                 source,
                                 DialectType::Presto | DialectType::Trino | DialectType::Athena
@@ -2536,7 +2587,7 @@ pub(super) fn rewrite(
                                     ))))
                                 }
                                 DialectType::Presto | DialectType::Trino if is_hive_source => {
-                                    // Presto: TO_UNIXTIME(COALESCE(TRY(DATE_PARSE(CAST(x AS VARCHAR), '%Y-%m-%d %T')), PARSE_DATETIME(DATE_FORMAT(x, '%Y-%m-%d %T'), 'yyyy-MM-dd HH:mm:ss')))
+                                    // Presto: parse Hive's default timestamp format.
                                     let cast_varchar =
                                         Expression::Cast(Box::new(crate::expressions::Cast {
                                             this: arg.clone(),
@@ -2552,7 +2603,7 @@ pub(super) fn rewrite(
                                         }));
                                     let date_parse = Expression::Function(Box::new(Function::new(
                                         "DATE_PARSE".to_string(),
-                                        vec![cast_varchar, Expression::string("%Y-%m-%d %T")],
+                                        vec![cast_varchar, Expression::string("%Y-%m-%d %H:%i:%s")],
                                     )));
                                     let try_expr = Expression::Function(Box::new(Function::new(
                                         "TRY".to_string(),
@@ -2561,7 +2612,7 @@ pub(super) fn rewrite(
                                     let date_format =
                                         Expression::Function(Box::new(Function::new(
                                             "DATE_FORMAT".to_string(),
-                                            vec![arg, Expression::string("%Y-%m-%d %T")],
+                                            vec![arg, Expression::string("%Y-%m-%d %H:%i:%s")],
                                         )));
                                     let parse_datetime =
                                         Expression::Function(Box::new(Function::new(
@@ -2591,6 +2642,37 @@ pub(super) fn rewrite(
                                     vec![arg],
                                 )))),
                             }
+                        }
+                        "UNIX_TIMESTAMP"
+                            if f.args.len() == 2
+                                && matches!(
+                                    source,
+                                    DialectType::Spark
+                                        | DialectType::Databricks
+                                        | DialectType::Hive
+                                )
+                                && matches!(target, DialectType::DuckDB) =>
+                        {
+                            let mut args = f.args;
+                            let value = args.remove(0);
+                            let format = match args.remove(0) {
+                                Expression::Literal(lit)
+                                    if matches!(lit.as_ref(), Literal::String(_)) =>
+                                {
+                                    let Literal::String(format) = lit.as_ref() else {
+                                        unreachable!()
+                                    };
+                                    Expression::string(java_to_strptime_format(format))
+                                }
+                                other => other,
+                            };
+                            Ok(Expression::Function(Box::new(Function::new(
+                                "EPOCH".to_string(),
+                                vec![Expression::Function(Box::new(Function::new(
+                                    "STRPTIME".to_string(),
+                                    vec![value, format],
+                                )))],
+                            ))))
                         }
                         // TO_UNIX_TIMESTAMP(x) -> UNIX_TIMESTAMP(x) for Spark/Hive
                         "TO_UNIX_TIMESTAMP" if f.args.len() >= 1 => match target {
@@ -3864,6 +3946,12 @@ pub(super) fn rewrite(
                                                     } else {
                                                         "TO_TIMESTAMP"
                                                     };
+                                                    let java_fmt = java_fmt
+                                                        .replace("MM", "M")
+                                                        .replace("dd", "d")
+                                                        .replace("HH", "H")
+                                                        .replace("mm", "m")
+                                                        .replace("ss", "s");
                                                     return Ok(Expression::Function(Box::new(
                                                         Function::new(
                                                             func_name.to_string(),
@@ -4300,21 +4388,21 @@ pub(super) fn rewrite(
 
                             fn c_to_java_format_parse(fmt: &str) -> String {
                                 fmt.replace("%Y", "yyyy")
-                                    .replace("%m", "MM")
-                                    .replace("%d", "dd")
-                                    .replace("%H", "HH")
-                                    .replace("%M", "mm")
-                                    .replace("%S", "ss")
+                                    .replace("%m", "M")
+                                    .replace("%d", "d")
+                                    .replace("%H", "H")
+                                    .replace("%M", "m")
+                                    .replace("%S", "s")
                                     .replace("%f", "SSSSSS")
                                     .replace("%y", "yy")
                                     .replace("%-m", "M")
                                     .replace("%-d", "d")
                                     .replace("%-H", "H")
                                     .replace("%-I", "h")
-                                    .replace("%I", "hh")
+                                    .replace("%I", "h")
                                     .replace("%p", "a")
-                                    .replace("%F", "yyyy-MM-dd")
-                                    .replace("%T", "HH:mm:ss")
+                                    .replace("%F", "yyyy-M-d")
+                                    .replace("%T", "H:m:s")
                             }
 
                             match target {
@@ -4577,7 +4665,7 @@ pub(super) fn rewrite(
                                                     },
                                                 )))
                                             } else {
-                                                let java_fmt = presto_to_java_format(s);
+                                                let java_fmt = presto_to_java_parse_format(s);
                                                 Ok(Expression::Function(Box::new(Function::new(
                                                     "TO_TIMESTAMP".to_string(),
                                                     vec![val, Expression::string(&java_fmt)],
@@ -4595,7 +4683,7 @@ pub(super) fn rewrite(
                                     if let Expression::Literal(lit) = fmt_expr {
                                         if let crate::expressions::Literal::String(s) = lit.as_ref()
                                         {
-                                            let java_fmt = presto_to_java_format(s);
+                                            let java_fmt = presto_to_java_parse_format(s);
                                             Ok(Expression::Function(Box::new(Function::new(
                                                 "TO_TIMESTAMP".to_string(),
                                                 vec![val, Expression::string(&java_fmt)],
@@ -4738,15 +4826,12 @@ pub(super) fn rewrite(
                             }
 
                             fn java_to_presto_format(fmt: &str) -> String {
-                                // Presto uses %T for HH:MM:SS
                                 let c_fmt = java_to_c_format(fmt);
-                                c_fmt.replace("%H:%M:%S", "%T")
+                                c_fmt.replace("%M", "%i").replace("%S", "%s")
                             }
 
                             fn java_to_bq_format(fmt: &str) -> String {
-                                // BigQuery uses %F for yyyy-MM-dd and %T for HH:mm:ss
-                                let c_fmt = java_to_c_format(fmt);
-                                c_fmt.replace("%Y-%m-%d", "%F").replace("%H:%M:%S", "%T")
+                                java_to_c_format(fmt)
                             }
 
                             // For Hive source, CAST string literals to appropriate type
@@ -5346,6 +5431,15 @@ pub(super) fn rewrite(
                             };
 
                             match target {
+                                DialectType::PostgreSQL | DialectType::Materialize => {
+                                    Ok(Expression::Paren(Box::new(Paren {
+                                        this: Expression::Sub(Box::new(BinaryOp::new(
+                                            temporal::force_cast_date(arg0),
+                                            temporal::force_cast_date(arg1),
+                                        ))),
+                                        trailing_comments: Vec::new(),
+                                    })))
+                                }
                                 DialectType::DuckDB => {
                                     // For Hive source, always CAST to DATE
                                     // If arg is TO_DATE(x) or TRY_CAST(x AS DATE), use it directly
@@ -5421,9 +5515,19 @@ pub(super) fn rewrite(
                                             ],
                                         ))))
                                     } else {
+                                        let truncate_day = |value: Expression| {
+                                            Expression::Function(Box::new(Function::new(
+                                                "DATE_TRUNC".to_string(),
+                                                vec![Expression::string("DAY"), value],
+                                            )))
+                                        };
                                         Ok(Expression::Function(Box::new(Function::new(
                                             "DATE_DIFF".to_string(),
-                                            vec![Expression::string("DAY"), arg1, arg0],
+                                            vec![
+                                                Expression::string("DAY"),
+                                                truncate_day(arg1),
+                                                truncate_day(arg0),
+                                            ],
                                         ))))
                                     }
                                 }
@@ -6634,6 +6738,14 @@ pub(super) fn rewrite(
                             let arg1 = args.remove(0);
                             let unit_str = temporal::get_unit_str_static(&arg0);
                             match target {
+                                DialectType::Spark | DialectType::Databricks
+                                    if matches!(source, DialectType::ClickHouse) =>
+                                {
+                                    Ok(Expression::Function(Box::new(Function::new(
+                                        "TRUNC".to_string(),
+                                        vec![arg1, Expression::string(&unit_str)],
+                                    ))))
+                                }
                                 DialectType::TSQL | DialectType::Fabric => {
                                     // Keep as DATETRUNC for TSQL - the target handler will uppercase the unit
                                     Ok(Expression::Function(Box::new(Function::new(
@@ -8196,40 +8308,7 @@ pub(super) fn rewrite(
                             let fmt_expr = args.remove(0);
                             if let Expression::Literal(ref lit) = fmt_expr {
                                 if let Literal::String(ref s) = lit.as_ref() {
-                                    // Convert Java/Spark format to C strptime format
-                                    fn java_to_c_fmt(fmt: &str) -> String {
-                                        let result = fmt
-                                            .replace("yyyy", "%Y")
-                                            .replace("SSSSSS", "%f")
-                                            .replace("EEEE", "%W")
-                                            .replace("MM", "%m")
-                                            .replace("dd", "%d")
-                                            .replace("HH", "%H")
-                                            .replace("mm", "%M")
-                                            .replace("ss", "%S")
-                                            .replace("yy", "%y");
-                                        let mut out = String::new();
-                                        let chars: Vec<char> = result.chars().collect();
-                                        let mut i = 0;
-                                        while i < chars.len() {
-                                            if chars[i] == '%' && i + 1 < chars.len() {
-                                                out.push(chars[i]);
-                                                out.push(chars[i + 1]);
-                                                i += 2;
-                                            } else if chars[i] == 'z' {
-                                                out.push_str("%Z");
-                                                i += 1;
-                                            } else if chars[i] == 'Z' {
-                                                out.push_str("%z");
-                                                i += 1;
-                                            } else {
-                                                out.push(chars[i]);
-                                                i += 1;
-                                            }
-                                        }
-                                        out
-                                    }
-                                    let c_fmt = java_to_c_fmt(s);
+                                    let c_fmt = java_to_strptime_format(s);
                                     Ok(Expression::Function(Box::new(Function::new(
                                         "STRPTIME".to_string(),
                                         vec![val, Expression::string(&c_fmt)],
@@ -8443,6 +8522,34 @@ pub(super) fn rewrite(
                                                     to: DataType::Date,
                                                     double_colon_syntax: false,
                                                     trailing_comments: vec![],
+                                                    format: None,
+                                                    default: None,
+                                                    inferred_type: None,
+                                                })))
+                                            }
+                                            DialectType::BigQuery => {
+                                                let bq_format =
+                                                    s.replace("yyyy", "YYYY").replace("dd", "DD");
+                                                let safe_timestamp =
+                                                    Expression::SafeCast(Box::new(Cast {
+                                                        this: val,
+                                                        to: DataType::Timestamp {
+                                                            precision: None,
+                                                            timezone: false,
+                                                        },
+                                                        double_colon_syntax: false,
+                                                        trailing_comments: Vec::new(),
+                                                        format: Some(Box::new(Expression::string(
+                                                            bq_format,
+                                                        ))),
+                                                        default: None,
+                                                        inferred_type: None,
+                                                    }));
+                                                Ok(Expression::Cast(Box::new(Cast {
+                                                    this: safe_timestamp,
+                                                    to: DataType::Date,
+                                                    double_colon_syntax: false,
+                                                    trailing_comments: Vec::new(),
                                                     format: None,
                                                     default: None,
                                                     inferred_type: None,
@@ -11103,6 +11210,84 @@ pub(super) fn rewrite(
                     // Extract the aggregate function and its argument
                     // We want AVG(IFF(condition, x, NULL))
                     match agg {
+                        Expression::WithinGroup(mut within_group) => {
+                            let iff = |value: Expression, condition: Expression| {
+                                Expression::Function(Box::new(Function::new(
+                                    "IFF".to_string(),
+                                    vec![condition, value, Expression::Null(Null)],
+                                )))
+                            };
+                            match within_group.this {
+                                Expression::ArrayAgg(mut array_agg) => {
+                                    array_agg.this = iff(array_agg.this, cond);
+                                    within_group.this = Expression::ArrayAgg(array_agg);
+                                    Ok(Expression::WithinGroup(within_group))
+                                }
+                                Expression::ListAgg(mut list_agg) => {
+                                    list_agg.this = iff(list_agg.this, cond);
+                                    within_group.this = Expression::ListAgg(list_agg);
+                                    Ok(Expression::WithinGroup(within_group))
+                                }
+                                Expression::PercentileCont(percentile) => {
+                                    for order in &mut within_group.order_by {
+                                        order.this = iff(order.this.clone(), cond.clone());
+                                    }
+                                    within_group.this = Expression::PercentileCont(percentile);
+                                    Ok(Expression::WithinGroup(within_group))
+                                }
+                                Expression::PercentileDisc(percentile) => {
+                                    for order in &mut within_group.order_by {
+                                        order.this = iff(order.this.clone(), cond.clone());
+                                    }
+                                    within_group.this = Expression::PercentileDisc(percentile);
+                                    Ok(Expression::WithinGroup(within_group))
+                                }
+                                Expression::Mode(mut mode) => {
+                                    if let Some(order) = within_group.order_by.first() {
+                                        mode.this = iff(order.this.clone(), cond);
+                                    }
+                                    mode.order_by.clear();
+                                    Ok(Expression::Mode(mode))
+                                }
+                                Expression::Function(mut function) => {
+                                    if let Some(first) = function.args.first_mut() {
+                                        *first = iff(first.clone(), cond);
+                                        within_group.this = Expression::Function(function);
+                                        Ok(Expression::WithinGroup(within_group))
+                                    } else {
+                                        Ok(Expression::Filter(Box::new(
+                                            crate::expressions::Filter {
+                                                this: Box::new(Expression::WithinGroup(Box::new(
+                                                    WithinGroup {
+                                                        this: Expression::Function(function),
+                                                        order_by: within_group.order_by,
+                                                    },
+                                                ))),
+                                                expression: Box::new(cond),
+                                            },
+                                        )))
+                                    }
+                                }
+                                Expression::AggregateFunction(mut function) => {
+                                    if let Some(first) = function.args.first_mut() {
+                                        *first = iff(first.clone(), cond);
+                                    }
+                                    within_group.this = Expression::AggregateFunction(function);
+                                    Ok(Expression::WithinGroup(within_group))
+                                }
+                                other => {
+                                    Ok(Expression::Filter(Box::new(crate::expressions::Filter {
+                                        this: Box::new(Expression::WithinGroup(Box::new(
+                                            WithinGroup {
+                                                this: other,
+                                                order_by: within_group.order_by,
+                                            },
+                                        ))),
+                                        expression: Box::new(cond),
+                                    })))
+                                }
+                            }
+                        }
                         Expression::Function(mut func) => {
                             if !func.args.is_empty() {
                                 let orig_arg = func.args[0].clone();
@@ -11115,6 +11300,60 @@ pub(super) fn rewrite(
                             } else {
                                 Ok(Expression::Filter(Box::new(crate::expressions::Filter {
                                     this: Box::new(Expression::Function(func)),
+                                    expression: Box::new(cond),
+                                })))
+                            }
+                        }
+                        Expression::AggregateFunction(mut function) => {
+                            if matches!(
+                                function.name.to_ascii_uppercase().as_str(),
+                                "QUANTILE_CONT" | "QUANTILE_DISC"
+                            ) && function.args.len() >= 2
+                            {
+                                let column = function.args.remove(0);
+                                let percentile = function.args.remove(0);
+                                let mut order_by = function.order_by;
+                                if order_by.is_empty() {
+                                    order_by.push(Ordered::asc(column.clone()));
+                                }
+                                for order in &mut order_by {
+                                    if order.desc && order.nulls_first.is_none() {
+                                        order.nulls_first = Some(false);
+                                    }
+                                    order.this = Expression::Function(Box::new(Function::new(
+                                        "IFF".to_string(),
+                                        vec![
+                                            cond.clone(),
+                                            order.this.clone(),
+                                            Expression::Null(Null),
+                                        ],
+                                    )));
+                                }
+                                let percentile = PercentileFunc {
+                                    this: column,
+                                    percentile,
+                                    order_by: None,
+                                    filter: None,
+                                };
+                                let inner = if function.name.eq_ignore_ascii_case("QUANTILE_CONT") {
+                                    Expression::PercentileCont(Box::new(percentile))
+                                } else {
+                                    Expression::PercentileDisc(Box::new(percentile))
+                                };
+                                Ok(Expression::WithinGroup(Box::new(WithinGroup {
+                                    this: inner,
+                                    order_by,
+                                })))
+                            } else if let Some(first) = function.args.first_mut() {
+                                *first = Expression::Function(Box::new(Function::new(
+                                    "IFF".to_string(),
+                                    vec![cond, first.clone(), Expression::Null(Null)],
+                                )));
+                                function.filter = None;
+                                Ok(Expression::AggregateFunction(function))
+                            } else {
+                                Ok(Expression::Filter(Box::new(crate::expressions::Filter {
+                                    this: Box::new(Expression::AggregateFunction(function)),
                                     expression: Box::new(cond),
                                 })))
                             }
@@ -12125,10 +12364,42 @@ pub(super) fn normalize_bigquery_function(
         // TIMESTAMP_DIFF(date1, date2, unit) -> TIMESTAMPDIFF(unit, date2, date1)
         // (BigQuery: result = date1 - date2, Standard: result = end - start)
         "TIMESTAMP_DIFF" | "DATETIME_DIFF" | "TIME_DIFF" if args.len() == 3 => {
-            let date1 = args.remove(0);
-            let date2 = args.remove(0);
+            let mut date1 = args.remove(0);
+            let mut date2 = args.remove(0);
             let unit_expr = args.remove(0);
             let unit_str = get_unit_str(&unit_expr);
+
+            if name == "DATETIME_DIFF"
+                && matches!(unit_str.as_str(), "MONTH" | "WEEK")
+                && matches!(
+                    target,
+                    DialectType::DuckDB | DialectType::Presto | DialectType::Trino
+                )
+            {
+                let align_boundary = |value: Expression| {
+                    let value = temporal::ensure_cast_timestamp(value);
+                    let value = if unit_str == "WEEK" {
+                        Expression::Add(Box::new(BinaryOp::new(
+                            value,
+                            Expression::Interval(Box::new(crate::expressions::Interval {
+                                this: Some(Expression::string("1")),
+                                unit: Some(crate::expressions::IntervalUnitSpec::Simple {
+                                    unit: crate::expressions::IntervalUnit::Day,
+                                    use_plural: false,
+                                }),
+                            })),
+                        )))
+                    } else {
+                        value
+                    };
+                    Expression::Function(Box::new(Function::new(
+                        "DATE_TRUNC".to_string(),
+                        vec![Expression::string(&unit_str), value],
+                    )))
+                };
+                date1 = align_boundary(date1);
+                date2 = align_boundary(date2);
+            }
 
             if matches!(target, DialectType::BigQuery) {
                 // BigQuery -> BigQuery: just uppercase the unit
@@ -12199,6 +12470,13 @@ pub(super) fn normalize_bigquery_function(
                         cast_d2,
                         cast_d1,
                     ],
+                ))));
+            }
+
+            if matches!(target, DialectType::Presto | DialectType::Trino) {
+                return Ok(Expression::Function(Box::new(Function::new(
+                    "DATE_DIFF".to_string(),
+                    vec![Expression::string(&unit_str), date2, date1],
                 ))));
             }
 
@@ -15269,6 +15547,14 @@ pub(super) fn normalize_bigquery_function(
                 DialectType::DuckDB => {
                     // CAST(STRPTIME(str, duck_format) AS DATE)
                     let duck_format = temporal::bq_format_to_duckdb(&format);
+                    let str_expr = Expression::Concat(Box::new(BinaryOp::new(
+                        Expression::string("1970 "),
+                        str_expr,
+                    )));
+                    let duck_format = Expression::Concat(Box::new(BinaryOp::new(
+                        Expression::string("%Y "),
+                        duck_format,
+                    )));
                     let strptime = Expression::Function(Box::new(Function::new(
                         "STRPTIME".to_string(),
                         vec![str_expr, duck_format],
@@ -15346,6 +15632,14 @@ pub(super) fn normalize_bigquery_function(
             match target {
                 DialectType::DuckDB => {
                     let duck_format = temporal::bq_format_to_duckdb(&format);
+                    let str_expr = Expression::Concat(Box::new(BinaryOp::new(
+                        Expression::string("1970 "),
+                        str_expr,
+                    )));
+                    let duck_format = Expression::Concat(Box::new(BinaryOp::new(
+                        Expression::string("%Y "),
+                        duck_format,
+                    )));
                     let strptime = Expression::Function(Box::new(Function::new(
                         "STRPTIME".to_string(),
                         vec![str_expr, duck_format],

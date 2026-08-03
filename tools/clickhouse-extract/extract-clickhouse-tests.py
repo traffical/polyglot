@@ -85,13 +85,6 @@ SKIP_FILES = {
     "03800_assume_not_null_coalesce_if_null_monotonicity_key_condition.sql",
 }
 
-# ClickHouse directive patterns to strip
-DIRECTIVE_PATTERNS = [
-    re.compile(r"--\s*\{.*?\}", re.DOTALL),  # -- { serverError ... }
-    re.compile(r"--\s*Tags:.*$", re.MULTILINE),
-    re.compile(r"--\s*\{\s*echo(On|Off)\s*\}", re.IGNORECASE),
-]
-
 # Runtime settings/format suffixes to strip
 SETTINGS_PATTERN = re.compile(r"\s+SETTINGS\s+\w+\s*=\s*[^;]*$", re.IGNORECASE)
 FORMAT_PATTERN = re.compile(r"\s+FORMAT\s+\w+(\s+\w+)*\s*$", re.IGNORECASE)
@@ -314,12 +307,9 @@ def extract_from_file(filepath: Path, max_length: int) -> list[dict]:
     except Exception:
         return []
 
-    # Strip ClickHouse test directives from content
-    cleaned = content
-    for pattern in DIRECTIVE_PATTERNS:
-        cleaned = pattern.sub('', cleaned)
-
-    raw_stmts = split_statements(cleaned)
+    # Test directives are line comments, so the SQL-aware splitter removes them
+    # without mistaking documentation such as `-- {1} EXCEPT ...` for a directive.
+    raw_stmts = split_statements(content)
     results = []
 
     for stmt in raw_stmts:

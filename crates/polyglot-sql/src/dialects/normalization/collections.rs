@@ -862,7 +862,11 @@ pub(super) fn rewrite(
                         }
 
                         let seq = Expression::Function(Box::new(Function::new(
-                            "SEQUENCE".to_string(),
+                            if matches!(target, DialectType::BigQuery) {
+                                "GENERATE_ARRAY".to_string()
+                            } else {
+                                "SEQUENCE".to_string()
+                            },
                             seq_args,
                         )));
 

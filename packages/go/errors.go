@@ -8,8 +8,11 @@ import (
 )
 
 var (
-	ErrClosed          = errors.New("polyglot: client is closed")
-	ErrNoDefaultClient = errors.New("polyglot: default client is not configured")
+	ErrClosed              = errors.New("polyglot: client is closed")
+	ErrNoDefaultClient     = errors.New("polyglot: default client is not configured")
+	ErrColumnNotFound      = &Error{Status: ffi.StatusColumnNotFound}
+	ErrColumnIndeterminate = &Error{Status: ffi.StatusColumnIndeterminate}
+	ErrColumnAmbiguous     = &Error{Status: ffi.StatusColumnAmbiguous}
 )
 
 type Error struct {
@@ -58,6 +61,12 @@ func statusName(status int32) string {
 		return "invalid argument"
 	case ffi.StatusSerializationError:
 		return "serialization error"
+	case ffi.StatusColumnNotFound:
+		return "column not found"
+	case ffi.StatusColumnIndeterminate:
+		return "column position indeterminate"
+	case ffi.StatusColumnAmbiguous:
+		return "column ambiguous"
 	case ffi.StatusInternalError:
 		return "internal error"
 	default:

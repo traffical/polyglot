@@ -632,12 +632,9 @@ pub(super) fn rewrite(
 
             Action::ArrayAggToCollectList => {
                 // ARRAY_AGG(x ORDER BY ...) -> COLLECT_LIST(x) for Hive/Spark
-                // Python sqlglot Hive.arrayagg_sql strips ORDER BY for simple cases
-                // but preserves it when DISTINCT/IGNORE NULLS/LIMIT are present
                 match e {
                     Expression::AggregateFunction(mut af) => {
-                        let is_simple =
-                            !af.distinct && af.ignore_nulls.is_none() && af.limit.is_none();
+                        let preserves_order = af.limit.is_some();
                         let args = if af.args.is_empty() {
                             vec![]
                         } else {
@@ -645,24 +642,23 @@ pub(super) fn rewrite(
                         };
                         af.name = "COLLECT_LIST".to_string();
                         af.args = args;
-                        if is_simple {
+                        if !preserves_order {
                             af.order_by = Vec::new();
                         }
                         Ok(Expression::AggregateFunction(af))
                     }
                     Expression::ArrayAgg(agg) => {
-                        let is_simple =
-                            !agg.distinct && agg.ignore_nulls.is_none() && agg.limit.is_none();
+                        let preserves_order = agg.limit.is_some();
                         Ok(Expression::AggregateFunction(Box::new(
                             crate::expressions::AggregateFunction {
                                 name: "COLLECT_LIST".to_string(),
                                 args: vec![agg.this.clone()],
                                 distinct: agg.distinct,
                                 filter: agg.filter.clone(),
-                                order_by: if is_simple {
-                                    Vec::new()
-                                } else {
+                                order_by: if preserves_order {
                                     agg.order_by.clone()
+                                } else {
+                                    Vec::new()
                                 },
                                 limit: agg.limit.clone(),
                                 ignore_nulls: agg.ignore_nulls,
@@ -716,14 +712,19 @@ pub(super) fn rewrite(
             }
 
             Action::ArrayAggIgnoreNullsDuckDB => {
-                // ARRAY_AGG(x IGNORE NULLS ORDER BY a, b DESC) -> ARRAY_AGG(x ORDER BY a NULLS FIRST, b DESC)
-                // Strip IGNORE NULLS, add NULLS FIRST to first ORDER BY column
+                // ARRAY_AGG(x IGNORE NULLS ...) -> ARRAY_AGG(x ...) FILTER(WHERE x IS NOT NULL)
+                // DuckDB also needs NULLS FIRST on the first inline ordering expression.
                 let mut agg = if let Expression::ArrayAgg(a) = e {
                     *a
                 } else {
                     unreachable!("action only triggered for ArrayAgg expressions")
                 };
-                agg.ignore_nulls = None; // Strip IGNORE NULLS
+                agg.ignore_nulls = None;
+                agg.filter = Some(Expression::IsNull(Box::new(IsNull {
+                    this: agg.this.clone(),
+                    not: true,
+                    postfix_form: false,
+                })));
                 if !agg.order_by.is_empty() {
                     agg.order_by[0].nulls_first = Some(true);
                 }
@@ -858,11 +859,19 @@ pub(super) fn rewrite(
 
             Action::AggFilterToIff => {
                 // AggFunc.filter -> IFF wrapping: AVG(x) FILTER(WHERE cond) -> AVG(IFF(cond, x, NULL))
+                let prefix_not_null = |condition: Expression| match condition {
+                    Expression::IsNull(mut is_null) if is_null.not => {
+                        is_null.postfix_form = true;
+                        Expression::IsNull(is_null)
+                    }
+                    other => other,
+                };
                 // Helper macro to handle the common AggFunc case
                 macro_rules! handle_agg_filter_to_iff {
                     ($variant:ident, $agg:expr) => {{
                         let mut agg = $agg;
                         if let Some(filter_cond) = agg.filter.take() {
+                            let filter_cond = prefix_not_null(filter_cond);
                             let iff_call = Expression::Function(Box::new(Function::new(
                                 "IFF".to_string(),
                                 vec![filter_cond, agg.this.clone(), Expression::Null(Null)],
@@ -878,7 +887,24 @@ pub(super) fn rewrite(
                     Expression::Sum(agg) => handle_agg_filter_to_iff!(Sum, agg),
                     Expression::Min(agg) => handle_agg_filter_to_iff!(Min, agg),
                     Expression::Max(agg) => handle_agg_filter_to_iff!(Max, agg),
-                    Expression::ArrayAgg(agg) => handle_agg_filter_to_iff!(ArrayAgg, agg),
+                    Expression::ArrayAgg(mut agg) => {
+                        if let Some(filter_cond) = agg.filter.take() {
+                            let filter_cond = prefix_not_null(filter_cond);
+                            agg.this = Expression::Function(Box::new(Function::new(
+                                "IFF".to_string(),
+                                vec![filter_cond, agg.this, Expression::Null(Null)],
+                            )));
+                        }
+                        if agg.order_by.is_empty() {
+                            Ok(Expression::ArrayAgg(agg))
+                        } else {
+                            let order_by = std::mem::take(&mut agg.order_by);
+                            Ok(Expression::WithinGroup(Box::new(WithinGroup {
+                                this: Expression::ArrayAgg(agg),
+                                order_by,
+                            })))
+                        }
+                    }
                     Expression::CountIf(agg) => handle_agg_filter_to_iff!(CountIf, agg),
                     Expression::Stddev(agg) => handle_agg_filter_to_iff!(Stddev, agg),
                     Expression::StddevPop(agg) => handle_agg_filter_to_iff!(StddevPop, agg),
@@ -896,7 +922,21 @@ pub(super) fn rewrite(
                     }
                     Expression::Count(mut c) => {
                         if let Some(filter_cond) = c.filter.take() {
-                            if let Some(ref this_expr) = c.this {
+                            let filter_cond = prefix_not_null(filter_cond);
+                            let is_star = c.star || matches!(c.this, Some(Expression::Star(_)));
+                            if is_star {
+                                return Ok(Expression::CountIf(Box::new(AggFunc {
+                                    this: filter_cond,
+                                    distinct: false,
+                                    filter: None,
+                                    order_by: Vec::new(),
+                                    name: None,
+                                    ignore_nulls: None,
+                                    having_max: None,
+                                    limit: None,
+                                    inferred_type: None,
+                                })));
+                            } else if let Some(ref this_expr) = c.this {
                                 let iff_call = Expression::Function(Box::new(Function::new(
                                     "IFF".to_string(),
                                     vec![filter_cond, this_expr.clone(), Expression::Null(Null)],
@@ -905,6 +945,18 @@ pub(super) fn rewrite(
                             }
                         }
                         Ok(Expression::Count(c))
+                    }
+                    Expression::AggregateFunction(mut af) => {
+                        if let Some(filter_cond) = af.filter.take() {
+                            let filter_cond = prefix_not_null(filter_cond);
+                            if let Some(first_arg) = af.args.first_mut() {
+                                *first_arg = Expression::Function(Box::new(Function::new(
+                                    "IFF".to_string(),
+                                    vec![filter_cond, first_arg.clone(), Expression::Null(Null)],
+                                )));
+                            }
+                        }
+                        Ok(Expression::AggregateFunction(af))
                     }
                     other => Ok(other),
                 }

@@ -112,6 +112,8 @@ pub struct MappingSchema {
     normalize: bool,
     /// Visible columns per table
     visible: HashMap<String, HashSet<String>>,
+    /// Declared column order per normalized table path.
+    column_order: HashMap<String, Vec<String>>,
     /// Cached depth
     cached_depth: usize,
 }
@@ -140,6 +142,7 @@ impl MappingSchema {
             dialect: None,
             normalize: true,
             visible: HashMap::new(),
+            column_order: HashMap::new(),
             cached_depth: 0,
         }
     }
@@ -352,8 +355,13 @@ impl Schema for MappingSchema {
                 (normalized_name, ColumnInfo::new(dtype.clone()))
             })
             .collect();
+        let column_order: Vec<String> = columns
+            .iter()
+            .map(|(name, _)| self.normalize_name(name, false))
+            .collect();
 
         self.add_table_internal(&parts, cols)?;
+        self.column_order.insert(parts.join("."), column_order);
         self.update_depth();
         Ok(())
     }
@@ -361,12 +369,32 @@ impl Schema for MappingSchema {
     fn column_names(&self, table: &str) -> SchemaResult<Vec<String>> {
         let cols = self.find_table(table)?;
         let table_key = self.normalize_name(table, true);
+        let ordered_columns = self
+            .column_order
+            .get(&self.parse_table_parts(table).join("."));
 
         // Check visibility
         if let Some(visible_cols) = self.visible.get(&table_key) {
-            Ok(cols
-                .keys()
-                .filter(|k| visible_cols.contains(*k))
+            Ok(ordered_columns
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .filter(|column| {
+                            cols.contains_key(*column) && visible_cols.contains(*column)
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    cols.keys()
+                        .filter(|column| visible_cols.contains(*column))
+                        .cloned()
+                        .collect()
+                }))
+        } else if let Some(columns) = ordered_columns {
+            Ok(columns
+                .iter()
+                .filter(|column| cols.contains_key(*column))
                 .cloned()
                 .collect())
         } else {
@@ -670,9 +698,7 @@ mod tests {
         schema.add_table("users", &columns, None).unwrap();
 
         let names = schema.column_names("users").unwrap();
-        assert_eq!(names.len(), 2);
-        assert!(names.contains(&"id".to_string()));
-        assert!(names.contains(&"name".to_string()));
+        assert_eq!(names, vec!["id", "name"]);
     }
 
     #[test]

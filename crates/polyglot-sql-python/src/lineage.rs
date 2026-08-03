@@ -71,6 +71,128 @@ pub fn lineage_with_schema(
     to_python_object(py, &node)
 }
 
+#[pyfunction(signature = (ordinal, sql, dialect = "generic"))]
+pub fn lineage_at(py: Python<'_>, ordinal: usize, sql: &str, dialect: &str) -> PyResult<Py<PyAny>> {
+    resolve_dialect(dialect)?;
+
+    let node = py.detach(|| {
+        let dialect_impl = polyglot_sql::dialects::Dialect::get_by_name(dialect)
+            .expect("dialect existence checked before entering detach");
+        let expression = parse_single_statement(sql, &dialect_impl)?;
+        let dialect_type = dialect_impl.dialect_type();
+        let dialect_option = if dialect_type == polyglot_sql::DialectType::Generic {
+            None
+        } else {
+            Some(dialect_type)
+        };
+        core_lineage::lineage_at(ordinal, &expression, dialect_option, false)
+            .map_err(map_transpile_error)
+    })?;
+
+    to_python_object(py, &node)
+}
+
+#[pyfunction(signature = (ordinal, sql, schema, dialect = "generic"))]
+pub fn lineage_at_with_schema(
+    py: Python<'_>,
+    ordinal: usize,
+    sql: &str,
+    schema: &Bound<'_, PyAny>,
+    dialect: &str,
+) -> PyResult<Py<PyAny>> {
+    resolve_dialect(dialect)?;
+    let validation_schema: polyglot_sql::ValidationSchema = depythonize(schema).map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Invalid schema object (expected ValidationSchema shape): {err}"
+        ))
+    })?;
+    let dialect_type = polyglot_sql::dialects::Dialect::get_by_name(dialect)
+        .expect("dialect existence checked")
+        .dialect_type();
+    let mapping_schema = polyglot_sql::mapping_schema_from_validation_schema_with_dialect(
+        &validation_schema,
+        dialect_type,
+    );
+
+    let node = py.detach(|| {
+        let dialect_impl = polyglot_sql::dialects::Dialect::get_by_name(dialect)
+            .expect("dialect existence checked before entering detach");
+        let expression = parse_single_statement(sql, &dialect_impl)?;
+        let dialect_option = if dialect_type == polyglot_sql::DialectType::Generic {
+            None
+        } else {
+            Some(dialect_type)
+        };
+        core_lineage::lineage_at_with_schema(
+            ordinal,
+            &expression,
+            Some(&mapping_schema),
+            dialect_option,
+            false,
+        )
+        .map_err(map_transpile_error)
+    })?;
+
+    to_python_object(py, &node)
+}
+
+#[pyfunction(signature = (sql, dialect = "generic"))]
+pub fn output_columns(py: Python<'_>, sql: &str, dialect: &str) -> PyResult<Py<PyAny>> {
+    resolve_dialect(dialect)?;
+
+    let output = py.detach(|| {
+        let dialect_impl = polyglot_sql::dialects::Dialect::get_by_name(dialect)
+            .expect("dialect existence checked before entering detach");
+        let expression = parse_single_statement(sql, &dialect_impl)?;
+        let dialect_type = dialect_impl.dialect_type();
+        let dialect_option = if dialect_type == polyglot_sql::DialectType::Generic {
+            None
+        } else {
+            Some(dialect_type)
+        };
+        core_lineage::output_columns(&expression, dialect_option).map_err(map_transpile_error)
+    })?;
+
+    to_python_object(py, &output)
+}
+
+#[pyfunction(signature = (sql, schema, dialect = "generic"))]
+pub fn output_columns_with_schema(
+    py: Python<'_>,
+    sql: &str,
+    schema: &Bound<'_, PyAny>,
+    dialect: &str,
+) -> PyResult<Py<PyAny>> {
+    resolve_dialect(dialect)?;
+    let validation_schema: polyglot_sql::ValidationSchema = depythonize(schema).map_err(|err| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Invalid schema object (expected ValidationSchema shape): {err}"
+        ))
+    })?;
+    let dialect_type = polyglot_sql::dialects::Dialect::get_by_name(dialect)
+        .expect("dialect existence checked")
+        .dialect_type();
+    let mapping_schema = polyglot_sql::mapping_schema_from_validation_schema_with_dialect(
+        &validation_schema,
+        dialect_type,
+    );
+
+    let output = py.detach(|| {
+        let dialect_impl = polyglot_sql::dialects::Dialect::get_by_name(dialect)
+            .expect("dialect existence checked before entering detach");
+        let expression = parse_single_statement(sql, &dialect_impl)?;
+        let dialect_option = if dialect_type == polyglot_sql::DialectType::Generic {
+            None
+        } else {
+            Some(dialect_type)
+        };
+        core_lineage::output_columns_with_schema(&expression, Some(&mapping_schema), dialect_option)
+            .map_err(map_transpile_error)
+    })?;
+
+    to_python_object(py, &output)
+}
+
 #[pyfunction(signature = (column, sql, dialect = "generic"))]
 pub fn source_tables(
     py: Python<'_>,

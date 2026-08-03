@@ -582,7 +582,13 @@ if (!result.success) {
 Trace how columns flow through SQL queries, from source tables to the result set.
 
 ```typescript
-import { lineage, lineageWithSchema, getSourceTables } from '@polyglot-sql/sdk';
+import {
+  lineage,
+  lineageAt,
+  lineageWithSchema,
+  outputColumns,
+  getSourceTables,
+} from '@polyglot-sql/sdk';
 
 // Trace a column through joins, CTEs, and subqueries
 const result = lineage('total', 'SELECT o.total FROM orders o JOIN users u ON o.user_id = u.id');
@@ -603,6 +609,22 @@ const schemaLineage = lineageWithSchema(
   'SELECT id FROM users u JOIN orders o ON u.id = o.user_id',
   schema,
 );
+
+// Inspect ordered outputs, including unnamed expressions and wildcards.
+const output = outputColumns('SELECT 1, t.*, total FROM t');
+// output.output.ordinalComplete === false
+
+// Trace the second output slot even when set-operation branches use different
+// names. Ordinals are zero-based.
+const ordinalLineage = lineageAt(
+  1,
+  'SELECT id, total FROM current_orders UNION ALL SELECT key, amount FROM archive_orders',
+);
+
+if (!ordinalLineage.success && ordinalLineage.columnResolution) {
+  console.log(ordinalLineage.columnResolution.reason);
+  // 'not_found', 'indeterminate', or 'ambiguous'
+}
 
 // Get all source tables that contribute to a column
 const tables = getSourceTables('total', 'SELECT o.total FROM orders o JOIN users u ON o.user_id = u.id');
@@ -811,7 +833,11 @@ const formattedSafe = pg.formatWithOptions('SELECT a,b FROM t', Dialect.Generic,
 | Function | Description |
 |----------|-------------|
 | `lineage(column, sql, dialect?, trimSelects?)` | Trace column lineage through a query |
+| `lineageAt(ordinal, sql, dialect?, trimSelects?)` | Trace a zero-based output ordinal |
+| `lineageAtWithSchema(ordinal, sql, schema, dialect?, trimSelects?)` | Trace a zero-based output ordinal after schema expansion |
 | `lineageWithSchema(column, sql, schema, dialect?, trimSelects?)` | Trace lineage with schema-based qualification |
+| `outputColumns(sql, dialect?)` | Describe ordered outputs, unnamed slots, and unresolved wildcards |
+| `outputColumnsWithSchema(sql, schema, dialect?)` | Describe ordered outputs after schema-aware wildcard expansion |
 | `getSourceTables(column, sql, dialect?)` | Get source tables for a column |
 | `analyzeQuery(sql, optionsOrDialect?)` | Return compact projection, visible relation, transitive base-table, CTE, set-operation, and upstream-reference facts |
 | `openLineageColumnLineage(sql, options)` | Build an OpenLineage columnLineage facet and datasets |

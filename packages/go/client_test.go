@@ -82,6 +82,24 @@ func TestVersion(t *testing.T) {
 	}
 }
 
+func TestColumnResolutionErrorSentinels(t *testing.T) {
+	tests := []struct {
+		status int32
+		target error
+	}{
+		{status: 7, target: ErrColumnNotFound},
+		{status: 8, target: ErrColumnIndeterminate},
+		{status: 9, target: ErrColumnAmbiguous},
+	}
+
+	for _, test := range tests {
+		err := &Error{Operation: "lineage_at", Status: test.status, Message: "resolution failed"}
+		if !errors.Is(err, test.target) {
+			t.Fatalf("errors.Is(%v, %v) = false", err, test.target)
+		}
+	}
+}
+
 func TestTranspileOptionsJSON(t *testing.T) {
 	payload, err := marshalOptions(TranspileOptions{
 		Pretty:           true,

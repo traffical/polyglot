@@ -27,7 +27,11 @@ pub use dialects::{polyglot_dialect_count, polyglot_dialect_list, polyglot_versi
 pub use diff::polyglot_diff;
 pub use format::{polyglot_format, polyglot_format_with_options};
 pub use generate::{polyglot_generate, polyglot_generate_data_type};
-pub use lineage::{polyglot_lineage, polyglot_lineage_with_schema, polyglot_source_tables};
+pub use lineage::{
+    polyglot_lineage, polyglot_lineage_at, polyglot_lineage_at_with_schema,
+    polyglot_lineage_with_schema, polyglot_output_columns, polyglot_output_columns_with_schema,
+    polyglot_source_tables,
+};
 pub use memory::{polyglot_free_result, polyglot_free_string, polyglot_free_validation_result};
 pub use openlineage::{
     polyglot_openlineage_column_lineage, polyglot_openlineage_job_event,

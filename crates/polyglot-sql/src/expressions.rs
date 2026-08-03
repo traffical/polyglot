@@ -6172,6 +6172,9 @@ pub struct TryCatch {
 pub struct ExecuteStatement {
     /// The procedure name (can be qualified: schema.proc_name)
     pub this: Expression,
+    /// Optional T-SQL return-status variable (`EXECUTE @status = procedure`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_status: Option<String>,
     /// Named parameters: @param=value pairs
     #[serde(default)]
     pub parameters: Vec<ExecuteParameter>,
@@ -8030,6 +8033,9 @@ pub enum TableConstraint {
     PrimaryKey {
         name: Option<Identifier>,
         columns: Vec<Identifier>,
+        /// Databricks primary-key columns marked with the TIMESERIES attribute.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        timeseries_columns: Vec<Identifier>,
         /// INCLUDE (columns) - non-key columns included in the index (PostgreSQL)
         #[serde(default)]
         include_columns: Vec<Identifier>,

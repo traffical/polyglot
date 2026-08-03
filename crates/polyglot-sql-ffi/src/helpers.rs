@@ -1,10 +1,10 @@
 use crate::types::{
-    PolyglotResult, PolyglotValidationResult, STATUS_GENERATE_ERROR, STATUS_INTERNAL_ERROR,
-    STATUS_INVALID_ARGUMENT, STATUS_PARSE_ERROR, STATUS_SERIALIZATION_ERROR,
-    STATUS_VALIDATION_ERROR,
+    PolyglotResult, PolyglotValidationResult, STATUS_COLUMN_AMBIGUOUS, STATUS_COLUMN_INDETERMINATE,
+    STATUS_COLUMN_NOT_FOUND, STATUS_GENERATE_ERROR, STATUS_INTERNAL_ERROR, STATUS_INVALID_ARGUMENT,
+    STATUS_PARSE_ERROR, STATUS_SERIALIZATION_ERROR, STATUS_VALIDATION_ERROR,
 };
 use polyglot_sql::dialects::{Dialect, DialectType};
-use polyglot_sql::{Error, Expression, ValidationResult};
+use polyglot_sql::{ColumnResolutionReason, Error, Expression, ValidationResult};
 use serde::Serialize;
 use std::any::Any;
 use std::ffi::{CStr, CString};
@@ -134,6 +134,12 @@ pub fn map_polyglot_error(error: &Error, fallback: i32) -> i32 {
     match error {
         Error::Parse { .. } | Error::Tokenize { .. } | Error::Syntax { .. } => STATUS_PARSE_ERROR,
         Error::Generate(_) => STATUS_GENERATE_ERROR,
+        Error::InvalidInput(_) => STATUS_INVALID_ARGUMENT,
+        Error::ColumnResolution { reason, .. } => match reason {
+            ColumnResolutionReason::NotFound => STATUS_COLUMN_NOT_FOUND,
+            ColumnResolutionReason::Indeterminate => STATUS_COLUMN_INDETERMINATE,
+            ColumnResolutionReason::Ambiguous => STATUS_COLUMN_AMBIGUOUS,
+        },
         _ => fallback,
     }
 }

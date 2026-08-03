@@ -15,7 +15,7 @@ use crate::expressions::{
     AggFunc, Alias, BinaryOp, Case, Cast, CeilFunc, Column, DataType, Expression, Function,
     Identifier, Interval, IntervalUnit, IntervalUnitSpec, IsNull, JSONPath, JSONPathKey,
     JSONPathRoot, JSONPathSubscript, JsonExtractFunc, Literal, Null, Paren, Struct, Subquery,
-    SubstringFunc, UnaryFunc, UnaryOp, VarArgFunc, WindowFunction,
+    SubstringFunc, UnaryFunc, UnaryOp, Unhex, VarArgFunc, WindowFunction,
 };
 #[cfg(feature = "generate")]
 use crate::generator::GeneratorConfig;
@@ -1687,6 +1687,14 @@ impl DuckDBDialect {
     fn transform_function(&self, f: Function) -> Result<Expression> {
         let name_upper = f.name.to_uppercase();
         match name_upper.as_str() {
+            "FROM_HEX" if f.args.len() == 1 => {
+                let mut args = f.args;
+                Ok(Expression::Unhex(Box::new(Unhex {
+                    this: Box::new(args.remove(0)),
+                    expression: None,
+                })))
+            }
+
             // IFNULL -> COALESCE
             "IFNULL" if f.args.len() == 2 => Ok(Expression::Coalesce(Box::new(VarArgFunc {
                 original_name: None,
@@ -1967,14 +1975,6 @@ impl DuckDBDialect {
                 "UNNEST".to_string(),
                 f.args,
             )))),
-
-            // NOW -> CURRENT_TIMESTAMP
-            "NOW" => Ok(Expression::CurrentTimestamp(
-                crate::expressions::CurrentTimestamp {
-                    precision: None,
-                    sysdate: false,
-                },
-            )),
 
             // GETDATE -> CURRENT_TIMESTAMP
             "GETDATE" => Ok(Expression::CurrentTimestamp(

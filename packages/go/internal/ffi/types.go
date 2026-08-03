@@ -3,14 +3,17 @@ package ffi
 import "unsafe"
 
 const (
-	StatusSuccess            int32 = 0
-	StatusParseError         int32 = 1
-	StatusGenerateError      int32 = 2
-	StatusTranspileError     int32 = 3
-	StatusValidationError    int32 = 4
-	StatusInvalidArgument    int32 = 5
-	StatusSerializationError int32 = 6
-	StatusInternalError      int32 = 99
+	StatusSuccess             int32 = 0
+	StatusParseError          int32 = 1
+	StatusGenerateError       int32 = 2
+	StatusTranspileError      int32 = 3
+	StatusValidationError     int32 = 4
+	StatusInvalidArgument     int32 = 5
+	StatusSerializationError  int32 = 6
+	StatusColumnNotFound      int32 = 7
+	StatusColumnIndeterminate int32 = 8
+	StatusColumnAmbiguous     int32 = 9
+	StatusInternalError       int32 = 99
 )
 
 // Result mirrors polyglot_result_t from crates/polyglot-sql-ffi.

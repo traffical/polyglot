@@ -1,6 +1,7 @@
 //! Error types for polyglot-sql
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
 /// The result type for polyglot operations
@@ -8,6 +9,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors that can occur during SQL parsing and generation
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Error during tokenization
     #[error("Tokenization error at line {line}, column {column}: {message}")]
@@ -45,6 +47,17 @@ pub enum Error {
         column: usize,
         start: usize,
         end: usize,
+    },
+
+    /// Invalid input for an operation after parsing has completed.
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
+    /// A requested output column could not be resolved.
+    #[error("Cannot resolve {target}: {reason}")]
+    ColumnResolution {
+        target: ColumnResolutionTarget,
+        reason: ColumnResolutionReason,
     },
 
     /// Internal error (should not happen in normal usage)
@@ -157,9 +170,65 @@ impl Error {
         }
     }
 
+    /// Create an invalid-input error.
+    pub fn invalid_input(message: impl Into<String>) -> Self {
+        Error::InvalidInput(message.into())
+    }
+
+    /// Create a structured column-resolution error.
+    pub fn column_resolution(
+        target: ColumnResolutionTarget,
+        reason: ColumnResolutionReason,
+    ) -> Self {
+        Error::ColumnResolution { target, reason }
+    }
+
     /// Create an internal error
     pub fn internal(message: impl Into<String>) -> Self {
         Error::Internal(message.into())
+    }
+}
+
+/// The output-column selector that failed to resolve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ColumnResolutionTarget {
+    /// Resolve an output column by name.
+    Name { name: String },
+    /// Resolve an output column by zero-based ordinal.
+    Ordinal { ordinal: usize },
+}
+
+impl fmt::Display for ColumnResolutionTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Name { name } => write!(f, "column '{name}'"),
+            Self::Ordinal { ordinal } => write!(f, "output ordinal {ordinal}"),
+        }
+    }
+}
+
+/// Why an output-column selector could not be resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColumnResolutionReason {
+    /// The output shape is known and does not contain the requested column.
+    NotFound,
+    /// An unresolved wildcard prevents the output position from being known.
+    Indeterminate,
+    /// More than one output position matches the requested name.
+    Ambiguous,
+}
+
+impl fmt::Display for ColumnResolutionReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("not found"),
+            Self::Indeterminate => {
+                f.write_str("indeterminate because an output wildcard could not be expanded")
+            }
+            Self::Ambiguous => f.write_str("ambiguous"),
+        }
     }
 }
 

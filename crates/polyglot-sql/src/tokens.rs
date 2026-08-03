@@ -2873,7 +2873,11 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
                 // Found closing """
                 break;
             }
-            value.push(self.advance());
+            if self.peek() == '\\' && self.config.string_escapes.contains(&'\\') {
+                self.scan_backslash_escape(&mut value);
+            } else {
+                value.push(self.advance());
+            }
         }
 
         if self.is_at_end() {
@@ -3648,9 +3652,9 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
                 && self.peek_next() == quote_char
                 && self.config.string_escapes_allowed_in_raw_strings
             {
-                // Backslash-escaped quote - works in raw strings when string_escapes_allowed_in_raw_strings is true
-                // e.g., \' inside r'...' becomes literal ' (BigQuery behavior)
-                // Spark/Databricks has this set to false, so backslash is always literal there
+                // The quote does not terminate the raw string, but both characters
+                // remain literal content.
+                value.push('\\');
                 value.push(quote_char);
                 self.advance(); // consume backslash
                 self.advance(); // consume quote
@@ -3680,14 +3684,22 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
         let mut value = String::new();
 
         while !self.is_at_end() {
-            let c = self.peek();
-            if c == quote_char && self.peek_next() == quote_char {
-                // Check for third quote
-                if self.current + 2 < self.size && self.char_at(self.current + 2) == quote_char {
-                    // Found three consecutive quotes - end of string
-                    self.advance(); // first closing quote
-                    self.advance(); // second closing quote
-                    self.advance(); // third closing quote
+            if self.peek() == quote_char {
+                let mut quote_count = 0;
+                while self.current + quote_count < self.size
+                    && self.char_at(self.current + quote_count) == quote_char
+                {
+                    quote_count += 1;
+                }
+                if quote_count >= 3 {
+                    // When more than three quotes occur, the leading quotes are content
+                    // and the final three terminate the raw triple-quoted string.
+                    for _ in 0..quote_count - 3 {
+                        value.push(quote_char);
+                    }
+                    for _ in 0..quote_count {
+                        self.advance();
+                    }
                     return Ok(value);
                 }
             }

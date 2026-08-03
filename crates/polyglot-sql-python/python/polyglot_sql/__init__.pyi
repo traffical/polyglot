@@ -21,6 +21,13 @@ class ValidationError(PolyglotError):
     """Raised when SQL validation encounters a fatal error."""
     ...
 
+class ColumnResolutionError(TranspileError):
+    """Raised when a requested output name or zero-based ordinal cannot be resolved."""
+
+    reason: str
+    column: str | None
+    ordinal: int | None
+
 
 class ValidationErrorInfo:
     """Details about a single validation finding."""
@@ -1656,6 +1663,38 @@ def lineage_with_schema(
     Returns:
         A dict describing the lineage graph.
     """
+    ...
+
+def lineage_at(
+    ordinal: int,
+    sql: str,
+    dialect: str = "generic",
+) -> dict[str, TypingAny]:
+    """Trace lineage for a zero-based output ordinal."""
+    ...
+
+def lineage_at_with_schema(
+    ordinal: int,
+    sql: str,
+    schema: dict[str, TypingAny],
+    dialect: str = "generic",
+) -> dict[str, TypingAny]:
+    """Trace schema-aware lineage for a zero-based output ordinal."""
+    ...
+
+def output_columns(
+    sql: str,
+    dialect: str = "generic",
+) -> dict[str, TypingAny]:
+    """Return the ordered query output description."""
+    ...
+
+def output_columns_with_schema(
+    sql: str,
+    schema: dict[str, TypingAny],
+    dialect: str = "generic",
+) -> dict[str, TypingAny]:
+    """Return the ordered output description after schema-aware wildcard expansion."""
     ...
 
 

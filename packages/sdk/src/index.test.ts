@@ -16,10 +16,12 @@ import {
   init,
   isInitialized,
   lineage,
+  lineageAt,
   lineageWithSchema,
   openLineageColumnLineage,
   openLineageJobEvent,
   openLineageRunEvent,
+  outputColumns,
   Polyglot,
   parse,
   parseDataType,
@@ -417,6 +419,47 @@ describe('Polyglot SDK', () => {
 
       expect(result.success).toBe(true);
       expect(result.tables).toContain('sensitive_table');
+    });
+
+    it('should trace a zero-based output ordinal across set-operation branches', () => {
+      const result = lineageAt(
+        1,
+        'SELECT a, b FROM t1 UNION ALL SELECT x, y FROM t2',
+        Dialect.Generic,
+      );
+
+      expect(result.success).toBe(true);
+      expect(collectNames(result.lineage!)).toEqual(
+        expect.arrayContaining(['t1.b', 't2.y']),
+      );
+    });
+
+    it('should expose structured ordinal resolution failures', () => {
+      const result = lineageAt(2, 'SELECT a FROM t', Dialect.Generic);
+
+      expect(result.success).toBe(false);
+      expect(result.columnResolution).toEqual({
+        target: { kind: 'ordinal', ordinal: 2 },
+        reason: 'not_found',
+      });
+    });
+
+    it('should preserve unnamed output slots and unresolved wildcards', () => {
+      const result = outputColumns('SELECT 1, t.*, b FROM t', Dialect.Generic);
+
+      expect(result.success).toBe(true);
+      expect(result.output).toEqual({
+        columns: [
+          { kind: 'unnamed', ordinal: 0 },
+          {
+            kind: 'wildcard',
+            qualifier: 't',
+            startOrdinal: 1,
+          },
+          { kind: 'named', name: 'b', ordinal: null },
+        ],
+        ordinalComplete: false,
+      });
     });
   });
 

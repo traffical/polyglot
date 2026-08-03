@@ -130,6 +130,42 @@ def test_lineage_with_schema_tolerates_partial_schema():
     assert "t.amount" in names
 
 
+def test_lineage_at_traces_set_operation_by_zero_based_ordinal():
+    result = polyglot_sql.lineage_at(
+        1,
+        "SELECT a, b FROM t1 UNION ALL SELECT x, y FROM t2",
+        dialect="generic",
+    )
+
+    names = collect_names(result)
+    assert "t1.b" in names
+    assert "t2.y" in names
+
+
+def test_lineage_at_raises_structured_resolution_error():
+    with pytest.raises(polyglot_sql.ColumnResolutionError) as exc_info:
+        polyglot_sql.lineage_at(2, "SELECT a FROM t", dialect="generic")
+
+    assert exc_info.value.reason == "not_found"
+    assert exc_info.value.column is None
+    assert exc_info.value.ordinal == 2
+
+
+def test_output_columns_preserves_unnamed_slots_and_wildcards():
+    output = polyglot_sql.output_columns(
+        "SELECT 1, t.*, b FROM t", dialect="generic"
+    )
+
+    assert output == {
+        "columns": [
+            {"kind": "unnamed", "ordinal": 0},
+            {"kind": "wildcard", "qualifier": "t", "startOrdinal": 1},
+            {"kind": "named", "name": "b", "ordinal": None},
+        ],
+        "ordinalComplete": False,
+    }
+
+
 def test_bigquery_unnest_lineage_marks_virtual_source():
     sql = """
 SELECT date_val AS week_start

@@ -32,6 +32,10 @@ fn _polyglot_sql(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(optimize::optimize, m)?)?;
     m.add_function(wrap_pyfunction!(lineage::lineage, m)?)?;
     m.add_function(wrap_pyfunction!(lineage::lineage_with_schema, m)?)?;
+    m.add_function(wrap_pyfunction!(lineage::lineage_at, m)?)?;
+    m.add_function(wrap_pyfunction!(lineage::lineage_at_with_schema, m)?)?;
+    m.add_function(wrap_pyfunction!(lineage::output_columns, m)?)?;
+    m.add_function(wrap_pyfunction!(lineage::output_columns_with_schema, m)?)?;
     m.add_function(wrap_pyfunction!(lineage::source_tables, m)?)?;
     m.add_function(wrap_pyfunction!(
         openlineage::openlineage_column_lineage,

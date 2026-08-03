@@ -3053,8 +3053,7 @@ impl Generator {
                         self.write(")");
                         return Ok(());
                     }
-                    Some(DialectType::Hive)
-                    | Some(DialectType::Spark)
+                    Some(DialectType::Spark)
                     | Some(DialectType::MySQL)
                     | Some(DialectType::SingleStore)
                     | Some(DialectType::TiDB)
@@ -3397,6 +3396,10 @@ impl Generator {
             Expression::Execute(exec) => {
                 self.write_keyword("EXECUTE");
                 self.write_space();
+                if let Some(return_status) = &exec.return_status {
+                    self.write(return_status);
+                    self.write(" = ");
+                }
                 self.generate_expression(&exec.this)?;
                 if exec.prepared {
                     if !exec.arguments.is_empty() {
@@ -4932,8 +4935,19 @@ impl Generator {
                     || source_is_cross_join_dialect
                     || self.config.source_dialect.is_none());
 
-            // Snowflake wraps standalone VALUES in FROM clause with parentheses
-            let wrap_values_in_parens = matches!(self.config.dialect, Some(DialectType::Snowflake));
+            // Generic SQL and VALUES-as-derived-table dialects wrap standalone VALUES
+            // table constructors in parentheses.
+            let wrap_values_in_parens = self.config.dialect.is_none()
+                || matches!(
+                    self.config.dialect,
+                    Some(
+                        DialectType::Generic
+                            | DialectType::Snowflake
+                            | DialectType::Presto
+                            | DialectType::Trino
+                            | DialectType::Athena
+                    )
+                );
 
             for (i, expr) in from.expressions.iter().enumerate() {
                 if i > 0 {
@@ -4943,13 +4957,7 @@ impl Generator {
                         self.write(", ");
                     }
                 }
-                if wrap_values_in_parens && matches!(expr, Expression::Values(_)) {
-                    self.write("(");
-                    self.generate_expression(expr)?;
-                    self.write(")");
-                } else {
-                    self.generate_expression(expr)?;
-                }
+                self.generate_from_source(expr, wrap_values_in_parens)?;
                 // Output leading comments that were on the table name before FROM
                 // (e.g., FROM \n/* comment */\n tbl PIVOT(...) -> ... PIVOT(...) /* comment */)
                 let leading = Self::extract_table_leading_comments(expr);
@@ -5498,7 +5506,6 @@ impl Generator {
                 // Convert FETCH to LIMIT for dialects that prefer LIMIT syntax
                 let use_limit = !fetch.percent
                     && !fetch.with_ties
-                    && fetch.count.is_some()
                     && matches!(
                         self.config.dialect,
                         Some(DialectType::Spark)
@@ -5518,7 +5525,11 @@ impl Generator {
                 if use_limit {
                     self.write_keyword("LIMIT");
                     self.write_space();
-                    self.generate_expression(fetch.count.as_ref().unwrap())?;
+                    if let Some(count) = &fetch.count {
+                        self.generate_expression(count)?;
+                    } else {
+                        self.write("1");
+                    }
                 } else {
                     self.write_keyword("FETCH");
                     self.write_space();
@@ -10158,6 +10169,7 @@ impl Generator {
             TableConstraint::PrimaryKey {
                 name,
                 columns,
+                timeseries_columns,
                 include_columns,
                 modifiers,
                 has_constraint_keyword,
@@ -10189,6 +10201,12 @@ impl Generator {
                         self.write(", ");
                     }
                     self.generate_identifier(col)?;
+                    if matches!(self.config.dialect, Some(DialectType::Databricks))
+                        && timeseries_columns.iter().any(|candidate| candidate == col)
+                    {
+                        self.write_space();
+                        self.write_keyword("TIMESERIES");
+                    }
                 }
                 self.write(")");
                 if !include_columns.is_empty() {
@@ -16724,7 +16742,18 @@ impl Generator {
             }
             self.write(".");
         }
-        self.generate_identifier(&col.name)?;
+        let postgres_qualified_keyword = col.table.is_some()
+            && matches!(self.config.dialect, Some(DialectType::PostgreSQL))
+            && !col.name.quoted
+            && matches!(
+                col.name.name.to_ascii_uppercase().as_str(),
+                "NULL" | "TRUE" | "FALSE"
+            );
+        if postgres_qualified_keyword {
+            self.write(&col.name.name);
+        } else {
+            self.generate_identifier(&col.name)?;
+        }
         // Oracle-style join marker (+)
         // Only output if dialect supports it (Oracle, Exasol)
         if col.join_mark && self.config.supports_column_join_marks {
@@ -17469,7 +17498,8 @@ impl Generator {
 
         // Output time travel clause: BEFORE (STATEMENT => ...) or AT (TIMESTAMP => ...)
         // Skip if CHANGES clause is present (CHANGES includes its own time travel)
-        if table.changes.is_none() {
+        let historical_data_post_alias = matches!(self.config.dialect, Some(DialectType::DuckDB));
+        if table.changes.is_none() && !historical_data_post_alias {
             if let Some(when) = &table.when {
                 self.write_space();
                 self.generate_historical_data(when)?;
@@ -17569,6 +17599,13 @@ impl Generator {
             if let Some(ref system_time) = table.system_time {
                 self.write_space();
                 self.write(system_time);
+            }
+        }
+
+        if historical_data_post_alias && table.changes.is_none() {
+            if let Some(when) = &table.when {
+                self.write_space();
+                self.generate_historical_data(when)?;
             }
         }
 
@@ -20828,6 +20865,14 @@ impl Generator {
     }
 
     fn generate_at_time_zone(&mut self, f: &AtTimeZone) -> Result<()> {
+        if matches!(&f.zone, Expression::Identifier(identifier) if identifier.name.eq_ignore_ascii_case("LOCAL"))
+        {
+            self.generate_expression(&f.this)?;
+            self.write_space();
+            self.write_keyword("AT LOCAL");
+            return Ok(());
+        }
+
         // Exasol uses CONVERT_TZ(timestamp, 'UTC', zone) instead of AT TIME ZONE
         if self.config.dialect == Some(DialectType::Exasol) {
             self.write_keyword("CONVERT_TZ");
@@ -24244,7 +24289,7 @@ impl Generator {
         let use_prefix_not = is_null.not
             && (self.config.dialect.is_none()
                 || self.config.dialect == Some(DialectType::Generic)
-                || is_null.postfix_form);
+                || (is_null.postfix_form && self.config.dialect != Some(DialectType::PostgreSQL)));
         if use_prefix_not {
             // NOT x IS NULL (generic normalization and NOTNULL postfix form)
             self.write_keyword("NOT");
@@ -31480,8 +31525,19 @@ impl Generator {
                 || source_is_cross_join_dialect2
                 || self.config.source_dialect.is_none());
 
-        // Snowflake wraps standalone VALUES in FROM clause with parentheses
-        let wrap_values_in_parens = matches!(self.config.dialect, Some(DialectType::Snowflake));
+        // Generic SQL and VALUES-as-derived-table dialects wrap standalone VALUES
+        // table constructors in parentheses.
+        let wrap_values_in_parens = self.config.dialect.is_none()
+            || matches!(
+                self.config.dialect,
+                Some(
+                    DialectType::Generic
+                        | DialectType::Snowflake
+                        | DialectType::Presto
+                        | DialectType::Trino
+                        | DialectType::Athena
+                )
+            );
 
         for (i, expr) in e.expressions.iter().enumerate() {
             if i > 0 {
@@ -31491,13 +31547,7 @@ impl Generator {
                     self.write(", ");
                 }
             }
-            if wrap_values_in_parens && matches!(expr, Expression::Values(_)) {
-                self.write("(");
-                self.generate_expression(expr)?;
-                self.write(")");
-            } else {
-                self.generate_expression(expr)?;
-            }
+            self.generate_from_source(expr, wrap_values_in_parens)?;
             // Output leading comments that were on the table name before FROM
             // (e.g., FROM \n/* comment */\n tbl PIVOT(...) -> ... PIVOT(...) /* comment */)
             let leading = Self::extract_table_leading_comments(expr);
@@ -31507,6 +31557,31 @@ impl Generator {
             }
         }
         Ok(())
+    }
+
+    fn generate_from_source(&mut self, expr: &Expression, wrap_values: bool) -> Result<()> {
+        if wrap_values {
+            if let Expression::Values(values) = expr {
+                let mut inner_values = values.as_ref().clone();
+                let alias = inner_values.alias.take();
+                let column_aliases = std::mem::take(&mut inner_values.column_aliases);
+
+                self.write("(");
+                self.generate_values(&inner_values)?;
+                self.write(")");
+
+                if let Some(alias) = alias {
+                    self.write_space();
+                    self.write_keyword("AS");
+                    self.write_space();
+                    self.generate_identifier(&alias)?;
+                    self.generate_alias_column_list(&column_aliases)?;
+                }
+                return Ok(());
+            }
+        }
+
+        self.generate_expression(expr)
     }
 
     /// Extract leading_comments from a table expression (possibly wrapped in PIVOT/UNPIVOT)
@@ -37528,11 +37603,25 @@ impl Generator {
     /// Convert strftime format (%Y, %m, %d, etc.) to Java date format (yyyy, MM, dd, etc.)
     /// Public static version for use by other modules
     pub fn strftime_to_java_format_static(fmt: &str) -> String {
-        Self::strftime_to_java_format(fmt)
+        Self::strftime_to_java_format_with_padding(fmt, true)
+    }
+
+    /// Convert strftime directives to the non-padded Java patterns used by
+    /// Spark's parsing functions in current sqlglot versions.
+    pub fn strftime_to_java_format_non_padded_static(fmt: &str) -> String {
+        Self::strftime_to_java_format_with_padding(fmt, false)
     }
 
     /// Convert strftime format (%Y, %m, %d, etc.) to Java date format (yyyy, MM, dd, etc.)
     fn strftime_to_java_format(fmt: &str) -> String {
+        Self::strftime_to_java_format_with_padding(fmt, true)
+    }
+
+    fn strftime_to_java_format_non_padded(fmt: &str) -> String {
+        Self::strftime_to_java_format_with_padding(fmt, false)
+    }
+
+    fn strftime_to_java_format_with_padding(fmt: &str, padded: bool) -> String {
         let mut result = String::with_capacity(fmt.len() * 2);
         let bytes = fmt.as_bytes();
         let len = bytes.len();
@@ -37559,14 +37648,44 @@ impl Generator {
                     let replacement = match bytes[i + 1] {
                         b'Y' => "yyyy",
                         b'y' => "yy",
-                        b'm' => "MM",
+                        b'm' => {
+                            if padded {
+                                "MM"
+                            } else {
+                                "M"
+                            }
+                        }
                         b'B' => "MMMM",
                         b'b' => "MMM",
-                        b'd' => "dd",
+                        b'd' => {
+                            if padded {
+                                "dd"
+                            } else {
+                                "d"
+                            }
+                        }
                         b'j' => "DDD",
-                        b'H' => "HH",
-                        b'M' => "mm",
-                        b'S' => "ss",
+                        b'H' => {
+                            if padded {
+                                "HH"
+                            } else {
+                                "H"
+                            }
+                        }
+                        b'M' => {
+                            if padded {
+                                "mm"
+                            } else {
+                                "m"
+                            }
+                        }
+                        b'S' => {
+                            if padded {
+                                "ss"
+                            } else {
+                                "s"
+                            }
+                        }
                         b'f' => "SSSSSS",
                         b'A' => "EEEE",
                         b'a' => "EEE",
@@ -37967,9 +38086,15 @@ impl Generator {
             Some(DialectType::Hive) => {
                 // Hive: CAST(x AS TIMESTAMP) for simple date formats
                 // Check both the raw format and the converted format (in case it's already Java)
-                let java_fmt = to_java(&e.format);
+                let java_fmt = if is_strftime {
+                    Self::strftime_to_java_format_non_padded(&e.format)
+                } else {
+                    Self::snowflake_format_to_spark(&e.format)
+                };
                 if java_fmt == "yyyy-MM-dd HH:mm:ss"
                     || java_fmt == "yyyy-MM-dd"
+                    || java_fmt == "yyyy-M-d H:m:s"
+                    || java_fmt == "yyyy-M-d"
                     || e.format == "yyyy-MM-dd HH:mm:ss"
                     || e.format == "yyyy-MM-dd"
                 {
@@ -37998,7 +38123,11 @@ impl Generator {
             }
             Some(DialectType::Spark) | Some(DialectType::Databricks) => {
                 // Spark: TO_TIMESTAMP(value, java_format)
-                let java_fmt = to_java(&e.format);
+                let java_fmt = if is_strftime {
+                    Self::strftime_to_java_format_non_padded(&e.format)
+                } else {
+                    Self::snowflake_format_to_spark(&e.format)
+                };
                 self.write_keyword("TO_TIMESTAMP");
                 self.write("(");
                 self.generate_expression(&e.this)?;
@@ -38189,28 +38318,28 @@ impl Generator {
                 result.push_str("MMM"); // abbreviated month
                 i += 3;
             } else if remaining.starts_with("mm") {
-                result.push_str("MM");
+                result.push('M');
                 i += 2;
             } else if remaining.starts_with("DD") {
-                result.push_str("dd");
+                result.push('d');
                 i += 2;
             } else if remaining.starts_with("dy") {
                 result.push_str("EEE"); // abbreviated day name
                 i += 2;
             } else if remaining.starts_with("hh24") {
-                result.push_str("HH");
+                result.push('H');
                 i += 4;
             } else if remaining.starts_with("hh12") {
-                result.push_str("hh");
+                result.push('h');
                 i += 4;
             } else if remaining.starts_with("hh") {
                 result.push_str("HH");
                 i += 2;
             } else if remaining.starts_with("mi") {
-                result.push_str("mm");
+                result.push('m');
                 i += 2;
             } else if remaining.starts_with("ss") {
-                result.push_str("ss");
+                result.push('s');
                 i += 2;
             } else if remaining.starts_with("ff") {
                 result.push_str("SSS"); // milliseconds
@@ -38259,7 +38388,7 @@ impl Generator {
                     self.generate_expression(this)?;
                 }
                 if let Some(format) = &e.format {
-                    let java_fmt = Self::strftime_to_java_format(format);
+                    let java_fmt = Self::strftime_to_java_format_non_padded(format);
                     if java_fmt != "yyyy-MM-dd HH:mm:ss" {
                         self.write(", '");
                         self.write(&java_fmt);
@@ -38330,7 +38459,7 @@ impl Generator {
                     self.generate_expression(this)?;
                 }
                 if let Some(format) = &e.format {
-                    let java_fmt = Self::strftime_to_java_format(format);
+                    let java_fmt = Self::strftime_to_java_format_non_padded(format);
                     self.write(", '");
                     self.write(&java_fmt);
                     self.write("'");
@@ -38963,11 +39092,9 @@ impl Generator {
             }
             Some(DialectType::BigQuery) => {
                 // BigQuery: FORMAT_DATE(format, value) - note swapped arg order
-                // Normalize: %Y-%m-%d -> %F, %H:%M:%S -> %T
-                let fmt = e.format.replace("%Y-%m-%d", "%F").replace("%H:%M:%S", "%T");
                 self.write_keyword("FORMAT_DATE");
                 self.write("('");
-                self.write(&fmt);
+                self.write(&e.format);
                 self.write("', ");
                 self.generate_expression(&e.this)?;
                 self.write(")");
@@ -40346,6 +40473,22 @@ impl Generator {
         // e.expression = the value expression
         // Hive does NOT use the FOR prefix for time travel
         use crate::dialects::DialectType;
+        if matches!(self.config.dialect, Some(DialectType::Dremio)) {
+            self.write_keyword("AT");
+            self.write_space();
+            let name = match e.this.as_ref() {
+                Expression::Identifier(ident) if ident.name.eq_ignore_ascii_case("VERSION") => {
+                    "SNAPSHOT"
+                }
+                _ => "TIMESTAMP",
+            };
+            self.write_keyword(name);
+            if let Some(expression) = &e.expression {
+                self.write_space();
+                self.generate_expression(expression)?;
+            }
+            return Ok(());
+        }
         let skip_for = matches!(
             self.config.dialect,
             Some(DialectType::Hive) | Some(DialectType::Spark) | Some(DialectType::Databricks)

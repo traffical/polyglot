@@ -11,7 +11,7 @@ use polyglot_sql::{
     diff::{diff_with_config, DiffConfig, Edit},
     expressions::{BooleanLiteral, DataType, Expression},
     format as core_format, format_with_options as core_format_with_options, get_all_tables,
-    lineage::{self, LineageNode},
+    lineage::{self, LineageNode, QueryOutput},
     mapping_schema_from_validation_schema_with_dialect,
     openlineage::{
         openlineage_column_lineage as core_openlineage_column_lineage,
@@ -20,9 +20,10 @@ use polyglot_sql::{
         OpenLineageDataset, OpenLineageOptions, OpenLineageWarning,
     },
     planner::{Plan, Step},
-    validate_with_schema as core_validate_with_schema, AnalyzeQueryOptions,
-    FormatGuardOptions as CoreFormatGuardOptions, QualifyTablesOptions, QueryAnalysis,
-    RenameTablesOptions, SchemaValidationOptions as CoreSchemaValidationOptions, Token,
+    validate_with_schema as core_validate_with_schema, AnalyzeQueryOptions, ColumnResolutionReason,
+    ColumnResolutionTarget, Error as CoreError, FormatGuardOptions as CoreFormatGuardOptions,
+    QualifyTablesOptions, QueryAnalysis, RenameTablesOptions,
+    SchemaValidationOptions as CoreSchemaValidationOptions, Token,
     ValidationOptions as CoreValidationOptions, ValidationResult as CoreValidationResult,
     ValidationSchema as CoreValidationSchema,
 };
@@ -1203,9 +1204,27 @@ pub fn version() -> String {
 // ============================================================================
 
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LineageResult {
     pub success: bool,
     pub lineage: Option<LineageNode>,
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column_resolution: Option<ColumnResolutionInfo>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ColumnResolutionInfo {
+    pub target: ColumnResolutionTarget,
+    pub reason: ColumnResolutionReason,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryOutputResult {
+    pub success: bool,
+    pub output: Option<QueryOutput>,
     pub error: Option<String>,
 }
 
@@ -1242,6 +1261,40 @@ pub struct OpenLineageEventResult {
     pub event: Option<serde_json::Value>,
     pub warnings: Vec<OpenLineageWarning>,
     pub error: Option<String>,
+}
+
+fn lineage_success(node: LineageNode) -> LineageResult {
+    LineageResult {
+        success: true,
+        lineage: Some(node),
+        error: None,
+        column_resolution: None,
+    }
+}
+
+fn lineage_failure_message(message: impl Into<String>) -> LineageResult {
+    LineageResult {
+        success: false,
+        lineage: None,
+        error: Some(message.into()),
+        column_resolution: None,
+    }
+}
+
+fn lineage_failure(error: CoreError) -> LineageResult {
+    let column_resolution = match &error {
+        CoreError::ColumnResolution { target, reason } => Some(ColumnResolutionInfo {
+            target: target.clone(),
+            reason: *reason,
+        }),
+        _ => None,
+    };
+    LineageResult {
+        success: false,
+        lineage: None,
+        error: Some(error.to_string()),
+        column_resolution,
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1314,13 +1367,7 @@ pub fn lineage_sql(sql: &str, column: &str, dialect: &str, trim_selects: bool) -
 fn lineage_internal(sql: &str, column: &str, dialect: &str, trim_selects: bool) -> LineageResult {
     let (expr, dialect_type) = match parse_first(sql, dialect) {
         Ok(v) => v,
-        Err(e) => {
-            return LineageResult {
-                success: false,
-                lineage: None,
-                error: Some(e),
-            };
-        }
+        Err(e) => return lineage_failure_message(e),
     };
 
     let dialect_opt = if dialect_type == DialectType::Generic {
@@ -1330,16 +1377,8 @@ fn lineage_internal(sql: &str, column: &str, dialect: &str, trim_selects: bool) 
     };
 
     match lineage::lineage(column, &expr, dialect_opt, trim_selects) {
-        Ok(node) => LineageResult {
-            success: true,
-            lineage: Some(node),
-            error: None,
-        },
-        Err(e) => LineageResult {
-            success: false,
-            lineage: None,
-            error: Some(e.to_string()),
-        },
+        Ok(node) => lineage_success(node),
+        Err(e) => lineage_failure(e),
     }
 }
 
@@ -1382,24 +1421,12 @@ fn lineage_with_schema_internal(
 ) -> LineageResult {
     let (expr, dialect_type) = match parse_first(sql, dialect) {
         Ok(v) => v,
-        Err(e) => {
-            return LineageResult {
-                success: false,
-                lineage: None,
-                error: Some(e),
-            };
-        }
+        Err(e) => return lineage_failure_message(e),
     };
 
     let validation_schema = match serde_json::from_str::<CoreValidationSchema>(schema_json) {
         Ok(schema) => schema,
-        Err(e) => {
-            return LineageResult {
-                success: false,
-                lineage: None,
-                error: Some(format!("Invalid schema JSON: {}", e)),
-            };
-        }
+        Err(e) => return lineage_failure_message(format!("Invalid schema JSON: {e}")),
     };
 
     let mapping_schema =
@@ -1417,15 +1444,168 @@ fn lineage_with_schema_internal(
         dialect_opt,
         trim_selects,
     ) {
-        Ok(node) => LineageResult {
+        Ok(node) => lineage_success(node),
+        Err(e) => lineage_failure(e),
+    }
+}
+
+/// Trace lineage for the column at a zero-based output ordinal.
+#[wasm_bindgen]
+pub fn lineage_sql_at(sql: &str, ordinal: usize, dialect: &str, trim_selects: bool) -> String {
+    set_panic_hook();
+    serialize_result(&lineage_at_internal(sql, ordinal, dialect, trim_selects))
+}
+
+fn lineage_at_internal(
+    sql: &str,
+    ordinal: usize,
+    dialect: &str,
+    trim_selects: bool,
+) -> LineageResult {
+    let (expression, dialect_type) = match parse_first(sql, dialect) {
+        Ok(value) => value,
+        Err(error) => return lineage_failure_message(error),
+    };
+    let dialect = (dialect_type != DialectType::Generic).then_some(dialect_type);
+
+    match lineage::lineage_at(ordinal, &expression, dialect, trim_selects) {
+        Ok(node) => lineage_success(node),
+        Err(error) => lineage_failure(error),
+    }
+}
+
+/// Trace schema-aware lineage for the column at a zero-based output ordinal.
+#[wasm_bindgen]
+pub fn lineage_sql_at_with_schema(
+    sql: &str,
+    ordinal: usize,
+    schema_json: &str,
+    dialect: &str,
+    trim_selects: bool,
+) -> String {
+    set_panic_hook();
+    serialize_result(&lineage_at_with_schema_internal(
+        sql,
+        ordinal,
+        schema_json,
+        dialect,
+        trim_selects,
+    ))
+}
+
+fn lineage_at_with_schema_internal(
+    sql: &str,
+    ordinal: usize,
+    schema_json: &str,
+    dialect: &str,
+    trim_selects: bool,
+) -> LineageResult {
+    let (expression, dialect_type) = match parse_first(sql, dialect) {
+        Ok(value) => value,
+        Err(error) => return lineage_failure_message(error),
+    };
+    let schema = match serde_json::from_str::<CoreValidationSchema>(schema_json) {
+        Ok(schema) => schema,
+        Err(error) => return lineage_failure_message(format!("Invalid schema JSON: {error}")),
+    };
+    let mapping_schema = mapping_schema_from_validation_schema_with_dialect(&schema, dialect_type);
+    let dialect = (dialect_type != DialectType::Generic).then_some(dialect_type);
+
+    match lineage::lineage_at_with_schema(
+        ordinal,
+        &expression,
+        Some(&mapping_schema),
+        dialect,
+        trim_selects,
+    ) {
+        Ok(node) => lineage_success(node),
+        Err(error) => lineage_failure(error),
+    }
+}
+
+/// Return the ordered output description of a query.
+#[wasm_bindgen]
+pub fn output_columns_sql(sql: &str, dialect: &str) -> String {
+    set_panic_hook();
+    serialize_result(&output_columns_internal(sql, dialect))
+}
+
+fn output_columns_internal(sql: &str, dialect: &str) -> QueryOutputResult {
+    let (expression, dialect_type) = match parse_first(sql, dialect) {
+        Ok(value) => value,
+        Err(error) => {
+            return QueryOutputResult {
+                success: false,
+                output: None,
+                error: Some(error),
+            }
+        }
+    };
+    let dialect = (dialect_type != DialectType::Generic).then_some(dialect_type);
+
+    match lineage::output_columns(&expression, dialect) {
+        Ok(output) => QueryOutputResult {
             success: true,
-            lineage: Some(node),
+            output: Some(output),
             error: None,
         },
-        Err(e) => LineageResult {
+        Err(error) => QueryOutputResult {
             success: false,
-            lineage: None,
-            error: Some(e.to_string()),
+            output: None,
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+/// Return the ordered output description of a query after schema-aware expansion.
+#[wasm_bindgen]
+pub fn output_columns_sql_with_schema(sql: &str, schema_json: &str, dialect: &str) -> String {
+    set_panic_hook();
+    serialize_result(&output_columns_with_schema_internal(
+        sql,
+        schema_json,
+        dialect,
+    ))
+}
+
+fn output_columns_with_schema_internal(
+    sql: &str,
+    schema_json: &str,
+    dialect: &str,
+) -> QueryOutputResult {
+    let (expression, dialect_type) = match parse_first(sql, dialect) {
+        Ok(value) => value,
+        Err(error) => {
+            return QueryOutputResult {
+                success: false,
+                output: None,
+                error: Some(error),
+            }
+        }
+    };
+    let schema = match serde_json::from_str::<CoreValidationSchema>(schema_json) {
+        Ok(schema) => schema,
+        Err(error) => {
+            return QueryOutputResult {
+                success: false,
+                output: None,
+                error: Some(format!("Invalid schema JSON: {error}")),
+            }
+        }
+    };
+    let mapping_schema = mapping_schema_from_validation_schema_with_dialect(&schema, dialect_type);
+    let dialect = (dialect_type != DialectType::Generic).then_some(dialect_type);
+
+    match lineage::output_columns_with_schema(&expression, Some(&mapping_schema), dialect) {
+        Ok(output) => QueryOutputResult {
+            success: true,
+            output: Some(output),
+            error: None,
+        },
+        Err(error) => QueryOutputResult {
+            success: false,
+            output: None,
+            error: Some(error.to_string()),
         },
     }
 }
@@ -3368,6 +3548,46 @@ mod tests {
     fn test_lineage_invalid_column() {
         let result = lineage_sql("SELECT a FROM t", "nonexistent", "generic", false);
         assert!(result.contains("\"success\":false"), "Result: {}", result);
+    }
+
+    #[test]
+    fn test_lineage_at_resolves_known_set_operation_branch() {
+        let result = lineage_sql_at(
+            "SELECT * FROM unknown_source UNION ALL \
+             SELECT known_first AS x, known_second AS y FROM known_source",
+            1,
+            "generic",
+            false,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed["success"], true, "Result: {result}");
+        let names = collect_lineage_names(&parsed["lineage"]);
+        assert!(
+            names.iter().any(|name| name == "known_source.known_second"),
+            "expected known branch lineage, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_lineage_exposes_structured_resolution_error() {
+        let result = lineage_sql_at("SELECT a FROM t", 1, "generic", false);
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed["success"], false);
+        assert_eq!(parsed["columnResolution"]["reason"], "not_found");
+        assert_eq!(parsed["columnResolution"]["target"]["kind"], "ordinal");
+        assert_eq!(parsed["columnResolution"]["target"]["ordinal"], 1);
+    }
+
+    #[test]
+    fn test_output_columns_reports_unresolved_wildcard() {
+        let result = output_columns_sql("SELECT a, *, tail FROM unknown_source", "generic");
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert_eq!(parsed["success"], true, "Result: {result}");
+        assert_eq!(parsed["output"]["ordinalComplete"], false);
+        assert_eq!(parsed["output"]["columns"][0]["ordinal"], 0);
+        assert_eq!(parsed["output"]["columns"][1]["kind"], "wildcard");
+        assert_eq!(parsed["output"]["columns"][1]["startOrdinal"], 1);
+        assert!(parsed["output"]["columns"][2]["ordinal"].is_null());
     }
 
     #[test]

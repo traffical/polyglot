@@ -7,7 +7,11 @@
 
 import {
   lineage_sql as wasmLineage,
+  lineage_sql_at as wasmLineageAt,
+  lineage_sql_at_with_schema as wasmLineageAtWithSchema,
   lineage_sql_with_schema as wasmLineageWithSchema,
+  output_columns_sql as wasmOutputColumns,
+  output_columns_sql_with_schema as wasmOutputColumnsWithSchema,
   source_tables as wasmSourceTables,
 } from '../wasm/polyglot_sql_wasm.js';
 import type { Expression } from './generated/Expression';
@@ -37,6 +41,41 @@ export interface LineageNode {
 export interface LineageResult {
   success: boolean;
   lineage?: LineageNode;
+  error?: string;
+  columnResolution?: ColumnResolutionInfo;
+}
+
+export type ColumnResolutionReason =
+  | 'not_found'
+  | 'indeterminate'
+  | 'ambiguous';
+
+export type ColumnResolutionTarget =
+  | { kind: 'name'; name: string }
+  | { kind: 'ordinal'; ordinal: number };
+
+export interface ColumnResolutionInfo {
+  target: ColumnResolutionTarget;
+  reason: ColumnResolutionReason;
+}
+
+export type OutputColumn =
+  | { kind: 'named'; name: string; ordinal: number | null }
+  | { kind: 'unnamed'; ordinal: number | null }
+  | {
+      kind: 'wildcard';
+      qualifier: string | null;
+      startOrdinal: number | null;
+    };
+
+export interface QueryOutput {
+  columns: OutputColumn[];
+  ordinalComplete: boolean;
+}
+
+export interface QueryOutputResult {
+  success: boolean;
+  output?: QueryOutput;
   error?: string;
 }
 
@@ -115,6 +154,54 @@ export function lineageWithSchema(
     trimSelects,
   );
   return JSON.parse(resultJson) as LineageResult;
+}
+
+/** Trace lineage for the column at a zero-based output ordinal. */
+export function lineageAt(
+  ordinal: number,
+  sql: string,
+  dialect: string = 'generic',
+  trimSelects: boolean = false,
+): LineageResult {
+  const resultJson = wasmLineageAt(sql, ordinal, dialect, trimSelects);
+  return JSON.parse(resultJson) as LineageResult;
+}
+
+/** Trace schema-aware lineage for the column at a zero-based output ordinal. */
+export function lineageAtWithSchema(
+  ordinal: number,
+  sql: string,
+  schema: Schema,
+  dialect: string = 'generic',
+  trimSelects: boolean = false,
+): LineageResult {
+  const resultJson = wasmLineageAtWithSchema(
+    sql,
+    ordinal,
+    JSON.stringify(schema),
+    dialect,
+    trimSelects,
+  );
+  return JSON.parse(resultJson) as LineageResult;
+}
+
+/** Return the ordered output description of a query. */
+export function outputColumns(
+  sql: string,
+  dialect: string = 'generic',
+): QueryOutputResult {
+  return JSON.parse(wasmOutputColumns(sql, dialect)) as QueryOutputResult;
+}
+
+/** Return the ordered output description after schema-aware wildcard expansion. */
+export function outputColumnsWithSchema(
+  sql: string,
+  schema: Schema,
+  dialect: string = 'generic',
+): QueryOutputResult {
+  return JSON.parse(
+    wasmOutputColumnsWithSchema(sql, JSON.stringify(schema), dialect),
+  ) as QueryOutputResult;
 }
 
 /**

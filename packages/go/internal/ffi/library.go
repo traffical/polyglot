@@ -31,7 +31,11 @@ type Library struct {
 	SetOrderBy               func(string, string) Result
 	RenameTablesWithOptions  func(string, string, string) Result
 	Lineage                  func(string, string, string) Result
+	LineageAt                func(uint64, string, string) Result
+	LineageAtWithSchema      func(uint64, string, string, string) Result
 	LineageWithSchema        func(string, string, string, string) Result
+	OutputColumns            func(string, string) Result
+	OutputColumnsWithSchema  func(string, string, string) Result
 	SourceTables             func(string, string, string) Result
 	OpenLineageColumnLineage func(string, string) Result
 	OpenLineageJobEvent      func(string, string) Result
@@ -98,7 +102,11 @@ func (l *Library) registerAll() error {
 		{"polyglot_set_order_by", &l.SetOrderBy},
 		{"polyglot_rename_tables_with_options", &l.RenameTablesWithOptions},
 		{"polyglot_lineage", &l.Lineage},
+		{"polyglot_lineage_at", &l.LineageAt},
+		{"polyglot_lineage_at_with_schema", &l.LineageAtWithSchema},
 		{"polyglot_lineage_with_schema", &l.LineageWithSchema},
+		{"polyglot_output_columns", &l.OutputColumns},
+		{"polyglot_output_columns_with_schema", &l.OutputColumnsWithSchema},
 		{"polyglot_source_tables", &l.SourceTables},
 		{"polyglot_openlineage_column_lineage", &l.OpenLineageColumnLineage},
 		{"polyglot_openlineage_job_event", &l.OpenLineageJobEvent},

@@ -195,6 +195,11 @@ All functions are exported from `polyglot_sql`.
 - `validate(sql: str, dialect: str = "generic", *, strict_syntax: bool = False, semantic: bool = False) -> ValidationResult`
 - `optimize(sql: str, dialect: str = "generic") -> str`
 - `lineage(column: str, sql: str, dialect: str = "generic") -> dict`
+- `lineage_at(ordinal: int, sql: str, dialect: str = "generic") -> dict`
+- `lineage_at_with_schema(ordinal: int, sql: str, schema: dict, dialect: str = "generic") -> dict`
+- `lineage_with_schema(column: str, sql: str, schema: dict, dialect: str = "generic") -> dict`
+- `output_columns(sql: str, dialect: str = "generic") -> dict`
+- `output_columns_with_schema(sql: str, schema: dict, dialect: str = "generic") -> dict`
 - `source_tables(column: str, sql: str, dialect: str = "generic") -> list[str]`
 - `analyze_query(sql: str, options: dict | None = None, dialect: str = "generic") -> dict`
 - `openlineage_column_lineage(sql: str, options: dict) -> dict`
@@ -219,6 +224,7 @@ Exception hierarchy:
 - `GenerateError`
 - `TranspileError`
 - `ValidationError`
+- `ColumnResolutionError` (`reason`, `column`, and `ordinal` attributes)
 
 Unknown dialect names raise built-in `ValueError`.
 

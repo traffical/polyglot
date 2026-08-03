@@ -1132,13 +1132,27 @@ export type { DiffEdit, DiffOptions, DiffResult, EditType } from './diff';
 export { changesOnly, diff, hasChanges } from './diff';
 export type { DataType } from './generated/DataType';
 export type {
+  ColumnResolutionInfo,
+  ColumnResolutionReason,
+  ColumnResolutionTarget,
   LineageNode,
   LineageResult,
   LineageSourceKind,
+  OutputColumn,
+  QueryOutput,
+  QueryOutputResult,
   SourceTablesResult,
 } from './lineage';
 // Re-export lineage module
-export { getSourceTables, lineage, lineageWithSchema } from './lineage';
+export {
+  getSourceTables,
+  lineage,
+  lineageAt,
+  lineageAtWithSchema,
+  lineageWithSchema,
+  outputColumns,
+  outputColumnsWithSchema,
+} from './lineage';
 export type {
   OpenLineageColumnLineageFacet,
   OpenLineageColumnLineageField,
@@ -1185,7 +1199,15 @@ export { validateWithSchema } from './validation/schema-validator';
 
 import { changesOnly, diff, hasChanges } from './diff';
 // Import new modules for default export
-import { getSourceTables, lineage, lineageWithSchema } from './lineage';
+import {
+  getSourceTables,
+  lineage,
+  lineageAt,
+  lineageAtWithSchema,
+  lineageWithSchema,
+  outputColumns,
+  outputColumnsWithSchema,
+} from './lineage';
 import {
   openLineageColumnLineage,
   openLineageJobEvent,
@@ -1209,7 +1231,11 @@ export default {
   getDialects,
   getVersion,
   lineage,
+  lineageAt,
+  lineageAtWithSchema,
   lineageWithSchema,
+  outputColumns,
+  outputColumnsWithSchema,
   getSourceTables,
   openLineageColumnLineage,
   openLineageJobEvent,

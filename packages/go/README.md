@@ -256,7 +256,11 @@ ast, _ = client.SetOrderBy(ast, json.RawMessage(
 | API | Description |
 | --- | --- |
 | `Lineage(column, sql, dialect string) (LineageNode, error)` | Return a lineage tree for a selected output column. |
+| `LineageAt(ordinal int, sql, dialect string) (LineageNode, error)` | Return lineage for a zero-based output ordinal. |
+| `LineageAtWithSchema(ordinal int, sql string, schema ValidationSchema, dialect string) (LineageNode, error)` | Return ordinal lineage after schema-aware wildcard expansion. |
 | `LineageWithSchema(column, sql string, schema ValidationSchema, dialect string) (LineageNode, error)` | Return lineage using schema metadata for improved resolution. |
+| `OutputColumns(sql, dialect string) (QueryOutput, error)` | Describe ordered outputs, unnamed slots, and unresolved wildcards. |
+| `OutputColumnsWithSchema(sql string, schema ValidationSchema, dialect string) (QueryOutput, error)` | Describe ordered outputs after schema-aware wildcard expansion. |
 | `SourceTables(column, sql, dialect string) ([]string, error)` | Return source table names for a selected output column. |
 | `AnalyzeQuery(sql string, options AnalyzeQueryOptions) (QueryAnalysis, error)` | Return compact projection, visible relation, transitive base-table, CTE, set-operation, and upstream-reference facts. |
 
@@ -271,6 +275,21 @@ if err != nil {
 	log.Fatal(err)
 }
 fmt.Println(node.Name, tables)
+
+ordinalNode, err := client.LineageAt(
+	1,
+	"SELECT id, total FROM current_orders UNION ALL SELECT key, amount FROM archive_orders",
+	"generic",
+)
+if errors.Is(err, polyglot.ErrColumnNotFound) {
+	log.Fatal("the query has no second output column")
+}
+
+output, err := client.OutputColumns("SELECT 1, t.*, total FROM t", "generic")
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(ordinalNode.Name, output.OrdinalComplete)
 ```
 
 ```go

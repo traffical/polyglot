@@ -86,6 +86,118 @@ pub(super) fn normalize(
     let expr = statements::normalize_root(expr, &context);
 
     transform_recursive(expr, &|e| {
+        if matches!(source, DialectType::DataFusion) && matches!(target, DialectType::DuckDB) {
+            if let Expression::Function(ref function) = e {
+                if function.name.eq_ignore_ascii_case("NOW") && function.args.is_empty() {
+                    return Ok(Expression::CurrentTimestamp(
+                        crate::expressions::CurrentTimestamp {
+                            precision: None,
+                            sysdate: false,
+                        },
+                    ));
+                }
+            }
+        }
+
+        if matches!(source, DialectType::Teradata)
+            && matches!(target, DialectType::Spark | DialectType::Databricks)
+        {
+            if let Expression::StrToDate(ref str_to_date) = e {
+                let mut normalized = str_to_date.as_ref().clone();
+                normalized.format = normalized.format.map(|format| format.replace("%d", "%-d"));
+                return Ok(Expression::StrToDate(Box::new(normalized)));
+            }
+        }
+
+        if matches!(source, DialectType::DuckDB) && matches!(target, DialectType::DuckDB) {
+            if let Expression::ArrayAgg(ref array_agg) = e {
+                if let Some(Expression::IsNull(is_null)) = &array_agg.filter {
+                    if is_null.not && !is_null.postfix_form {
+                        let mut normalized = array_agg.as_ref().clone();
+                        let mut condition = is_null.as_ref().clone();
+                        condition.postfix_form = true;
+                        normalized.filter = Some(Expression::IsNull(Box::new(condition)));
+                        return Ok(Expression::ArrayAgg(Box::new(normalized)));
+                    }
+                }
+            }
+        }
+
+        if matches!(source, DialectType::Generic) && matches!(target, DialectType::BigQuery) {
+            if let Expression::TimeToStr(ref time_to_str) = e {
+                let mut normalized = time_to_str.as_ref().clone();
+                normalized.format = normalized
+                    .format
+                    .replace("%Y-%m-%d", "%F")
+                    .replace("%H:%M:%S", "%T");
+                return Ok(Expression::TimeToStr(Box::new(normalized)));
+            }
+        }
+
+        if matches!(source, DialectType::Hive) && matches!(target, DialectType::Hive) {
+            if let Expression::Function(ref function) = e {
+                if function.name.eq_ignore_ascii_case("STR_TO_DATE") && function.args.len() == 1 {
+                    return Ok(Expression::Cast(Box::new(Cast {
+                        this: function.args[0].clone(),
+                        to: DataType::Date,
+                        trailing_comments: Vec::new(),
+                        double_colon_syntax: false,
+                        format: None,
+                        default: None,
+                        inferred_type: None,
+                    })));
+                }
+            }
+        }
+
+        if matches!(source, DialectType::Generic) && matches!(target, DialectType::Drill) {
+            if let Expression::ILike(ref like) = e {
+                return Ok(Expression::Function(Box::new(Function::new(
+                    "ILIKE".to_string(),
+                    vec![like.left.clone(), like.right.clone()],
+                ))));
+            }
+        }
+
+        // DuckDB canonicalizes `x IS NOT NULL` as prefix `NOT x IS NULL`.
+        if matches!(source, DialectType::DuckDB) {
+            if let Expression::IsNull(ref is_null) = e {
+                if is_null.not && !is_null.postfix_form {
+                    let mut normalized = is_null.as_ref().clone();
+                    normalized.postfix_form = true;
+                    return Ok(Expression::IsNull(Box::new(normalized)));
+                }
+            }
+        }
+
+        // Snowflake COUNT_IF requires an explicitly boolean predicate in DuckDB.
+        if matches!(source, DialectType::Snowflake) && matches!(target, DialectType::DuckDB) {
+            if let Expression::CountIf(ref count_if) = e {
+                let mut count_if = count_if.as_ref().clone();
+                count_if.this = Expression::Is(Box::new(crate::expressions::BinaryOp::new(
+                    Expression::Paren(Box::new(crate::expressions::Paren {
+                        this: count_if.this,
+                        trailing_comments: Vec::new(),
+                    })),
+                    Expression::Boolean(crate::expressions::BooleanLiteral { value: true }),
+                )));
+                return Ok(Expression::CountIf(Box::new(count_if)));
+            }
+        }
+
+        if matches!(source, DialectType::Presto | DialectType::Trino)
+            && matches!(target, DialectType::DuckDB)
+        {
+            if let Expression::Function(ref function) = e {
+                if function.name.eq_ignore_ascii_case("SHA256") && function.args.len() == 1 {
+                    return Ok(Expression::Unhex(Box::new(crate::expressions::Unhex {
+                        this: Box::new(Expression::Function(function.clone())),
+                        expression: None,
+                    })));
+                }
+            }
+        }
+
         if matches!(source, DialectType::PostgreSQL | DialectType::Redshift)
             && matches!(target, DialectType::TSQL | DialectType::Fabric)
         {
@@ -616,7 +728,100 @@ pub(super) fn normalize(
             }
         }
 
-        // BigQuery IN UNNEST(expr) -> IN (SELECT UNNEST/EXPLODE(expr)) for non-BigQuery targets
+        // BigQuery renders NOT IN UNNEST as prefix NOT around the membership predicate.
+        if matches!(source, DialectType::BigQuery) && matches!(target, DialectType::BigQuery) {
+            if let Expression::In(ref in_expr) = e {
+                if in_expr.not && in_expr.unnest.is_some() {
+                    let mut positive = in_expr.as_ref().clone();
+                    positive.not = false;
+                    return Ok(Expression::Not(Box::new(crate::expressions::UnaryOp::new(
+                        Expression::In(Box::new(positive)),
+                    ))));
+                }
+            }
+        }
+
+        // BigQuery IN UNNEST(expr) -> a NULL-aware DuckDB CASE expression.
+        if matches!(source, DialectType::BigQuery) && matches!(target, DialectType::DuckDB) {
+            if let Expression::In(ref in_expr) = e {
+                if let Some(ref unnest_inner) = in_expr.unnest {
+                    let array = unnest_inner.as_ref().clone();
+                    let value = in_expr.this.clone();
+                    let array_length = || {
+                        Expression::Function(Box::new(Function::new(
+                            "ARRAY_LENGTH".to_string(),
+                            vec![array.clone()],
+                        )))
+                    };
+                    let empty_or_null =
+                        Expression::Or(Box::new(crate::expressions::BinaryOp::new(
+                            Expression::IsNull(Box::new(crate::expressions::IsNull {
+                                this: array.clone(),
+                                not: false,
+                                postfix_form: false,
+                            })),
+                            Expression::Eq(Box::new(crate::expressions::BinaryOp::new(
+                                array_length(),
+                                Expression::number(0),
+                            ))),
+                        )));
+                    let contains = Expression::Function(Box::new(Function::new(
+                        "ARRAY_CONTAINS".to_string(),
+                        vec![array.clone(), value.clone()],
+                    )));
+                    let value_null_or_array_has_null =
+                        Expression::Or(Box::new(crate::expressions::BinaryOp::new(
+                            Expression::IsNull(Box::new(crate::expressions::IsNull {
+                                this: value,
+                                not: false,
+                                postfix_form: false,
+                            })),
+                            Expression::Neq(Box::new(crate::expressions::BinaryOp::new(
+                                array_length(),
+                                Expression::Function(Box::new(Function::new(
+                                    "LIST_COUNT".to_string(),
+                                    vec![array],
+                                ))),
+                            ))),
+                        )));
+                    let case = Expression::Case(Box::new(Case {
+                        operand: None,
+                        whens: vec![
+                            (
+                                empty_or_null,
+                                Expression::Boolean(crate::expressions::BooleanLiteral {
+                                    value: false,
+                                }),
+                            ),
+                            (
+                                contains,
+                                Expression::Boolean(crate::expressions::BooleanLiteral {
+                                    value: true,
+                                }),
+                            ),
+                            (
+                                value_null_or_array_has_null,
+                                Expression::Null(crate::expressions::Null),
+                            ),
+                        ],
+                        else_: Some(Expression::Boolean(crate::expressions::BooleanLiteral {
+                            value: false,
+                        })),
+                        comments: Vec::new(),
+                        inferred_type: None,
+                    }));
+                    return if in_expr.not {
+                        Ok(Expression::Not(Box::new(crate::expressions::UnaryOp::new(
+                            case,
+                        ))))
+                    } else {
+                        Ok(case)
+                    };
+                }
+            }
+        }
+
+        // BigQuery IN UNNEST(expr) -> IN (SELECT UNNEST/EXPLODE(expr)) for other targets
         if matches!(source, DialectType::BigQuery) && !matches!(target, DialectType::BigQuery) {
             if let Expression::In(ref in_expr) = e {
                 if let Some(ref unnest_inner) = in_expr.unnest {
@@ -1403,6 +1608,25 @@ pub(super) fn normalize(
             }
         }
 
+        // ARRAY_CONCAT_AGG -> DuckDB: flatten an ARRAY_AGG while excluding NULL arrays.
+        if matches!(target, DialectType::DuckDB) {
+            if let Expression::ArrayConcatAgg(ref agg) = e {
+                let mut agg = agg.as_ref().clone();
+                agg.name = None;
+                agg.filter = Some(Expression::IsNull(Box::new(crate::expressions::IsNull {
+                    this: agg.this.clone(),
+                    not: true,
+                    postfix_form: true,
+                })));
+                if let Some(first) = agg.order_by.first_mut() {
+                    first.nulls_first = Some(true);
+                }
+                return Ok(Expression::ArrayFlatten(Box::new(
+                    crate::expressions::UnaryFunc::new(Expression::ArrayAgg(Box::new(agg))),
+                )));
+            }
+        }
+
         // ARRAY_CONCAT_AGG -> others: keep as function for cross-dialect
         if !matches!(target, DialectType::BigQuery | DialectType::Snowflake) {
             if let Expression::ArrayConcatAgg(agg) = e {
@@ -1779,7 +2003,7 @@ pub(super) fn normalize(
                             | "STRFTIME" | "STRPTIME"
                             | "DATE_FORMAT" | "FORMAT_DATE"
                             | "PARSE_TIMESTAMP" | "PARSE_DATETIME" | "PARSE_DATE"
-                            | "FROM_ISO8601_TIMESTAMP" | "FROM_ISO8601_DATE"
+                            | "FROM_ISO8601_TIMESTAMP" | "FROM_ISO8601_TIMESTAMP_NANOS" | "FROM_ISO8601_DATE"
                             | "FROM_BASE64" | "TO_BASE64"
                             | "GETDATE"
                             | "TO_HEX" | "FROM_HEX" | "UNHEX" | "HEX"
@@ -1957,6 +2181,11 @@ pub(super) fn normalize(
                         }
                     }
                 }
+                Expression::AggregateFunction(af)
+                    if matches!(target, DialectType::Snowflake) && af.filter.is_some() =>
+                {
+                    Action::Aggregates(aggregates::Action::AggFilterToIff)
+                }
                 Expression::AggregateFunction(af) => {
                     let name = af.name.to_ascii_uppercase();
                     match name.as_str() {
@@ -2124,7 +2353,9 @@ pub(super) fn normalize(
                     _ => Action::None,
                 },
                 Expression::ArrayAgg(ref agg) => {
-                    if matches!(target, DialectType::MySQL | DialectType::SingleStore) {
+                    if matches!(target, DialectType::Snowflake) && agg.filter.is_some() {
+                        Action::Aggregates(aggregates::Action::AggFilterToIff)
+                    } else if matches!(target, DialectType::MySQL | DialectType::SingleStore) {
                         Action::Aggregates(aggregates::Action::ArrayAggToGroupConcat)
                     } else if matches!(
                         target,
@@ -2143,7 +2374,6 @@ pub(super) fn normalize(
                         Action::Aggregates(aggregates::Action::ArrayAggNullFilter)
                     } else if matches!(target, DialectType::DuckDB)
                         && agg.ignore_nulls == Some(true)
-                        && !agg.order_by.is_empty()
                     {
                         // BigQuery ARRAY_AGG(x IGNORE NULLS ORDER BY ...) -> DuckDB ARRAY_AGG(x ORDER BY a NULLS FIRST, ...)
                         Action::Aggregates(aggregates::Action::ArrayAggIgnoreNullsDuckDB)
