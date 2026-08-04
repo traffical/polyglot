@@ -1,6 +1,6 @@
 use polyglot_sql::{
     analyze_query, scope::SourceKind, AnalyzeQueryOptions, DialectType, ProjectionNullability,
-    QueryShape, ReferenceConfidence, TransformKind, ValidationSchema,
+    QueryShape, ReferenceConfidence, SetOperationBranchRole, TransformKind, ValidationSchema,
 };
 use serde_json::json;
 
@@ -208,6 +208,14 @@ fn analyze_query_reports_set_operations() {
     assert!(analysis.set_operations[0].all);
     assert_eq!(analysis.set_operations[0].output_columns, vec!["a"]);
     assert_eq!(analysis.set_operations[0].branches.len(), 2);
+    assert_eq!(
+        analysis.set_operations[0]
+            .branches
+            .iter()
+            .map(|branch| branch.role)
+            .collect::<Vec<_>>(),
+        vec![SetOperationBranchRole::Value, SetOperationBranchRole::Value]
+    );
     assert!(analysis
         .relations
         .iter()
@@ -230,6 +238,28 @@ fn analyze_query_reports_set_operations() {
             .as_deref(),
         Some("a")
     );
+
+    for operator in ["EXCEPT", "INTERSECT"] {
+        let analysis = analyze_query(
+            &format!("SELECT a FROM x {operator} SELECT b FROM y"),
+            AnalyzeQueryOptions {
+                dialect: DialectType::Generic,
+                schema: Some(schema()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            analysis.set_operations[0]
+                .branches
+                .iter()
+                .map(|branch| branch.role)
+                .collect::<Vec<_>>(),
+            vec![
+                SetOperationBranchRole::Value,
+                SetOperationBranchRole::Filter
+            ]
+        );
+    }
 }
 
 #[test]

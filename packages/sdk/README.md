@@ -637,6 +637,9 @@ Lineage nodes include `source_kind` and optional `source_alias` metadata. Table
 columns are marked as `table`, CTEs as `cte`, derived queries as
 `derived_table`, and virtual sources such as BigQuery `UNNEST(...) AS alias`
 are marked as `virtual`.
+Immediate set-operation branch roots also include optional `set_branch`
+metadata with the `operator`, original zero-based `ordinal`, and `all` flag.
+The ordinal remains stable when another branch cannot be resolved.
 
 ## Compact Query Analysis
 
@@ -649,6 +652,8 @@ projection `typeHint` values. `cteFacts` reports top-level CTE definitions,
 `starProjections` records original star projections and schema-expanded
 columns, and each projection includes conservative `nullability`: `'non_null'`,
 `'nullable'`, or `'unknown'`.
+Each `setOperations[].branches[]` entry has a `role`: both `UNION` branches are
+`'value'`, while the right branch of `EXCEPT` and `INTERSECT` is `'filter'`.
 For physical relation facts, `name` remains the qualified display name while
 `catalog`, `schema`, and `table` expose parsed identifier parts.
 
@@ -719,6 +724,11 @@ aliases in this payload.
 Generate OpenLineage-compatible JSON payloads from SQL analysis. The SDK only
 builds payloads; OpenLineage transport and client emission are intentionally out
 of scope.
+
+Set-operation queries are supported. `UNION` inputs are emitted as direct
+dependencies; the right input of `EXCEPT` and `INTERSECT` is emitted as an
+indirect `FILTER` dependency. If the same input field has both roles, one input
+field contains both transformations.
 
 ```typescript
 import {

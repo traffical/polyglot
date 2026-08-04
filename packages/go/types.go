@@ -2,7 +2,7 @@ package polyglot
 
 import "encoding/json"
 
-const sdkVersion = "0.7.0"
+const sdkVersion = "0.8.0"
 
 func Version() string {
 	return sdkVersion
@@ -119,7 +119,22 @@ type LineageNode struct {
 	SourceName        string          `json:"source_name"`
 	SourceKind        string          `json:"source_kind"`
 	SourceAlias       *string         `json:"source_alias,omitempty"`
+	SetBranch         *SetBranch      `json:"set_branch,omitempty"`
 	ReferenceNodeName string          `json:"reference_node_name"`
+}
+
+type SetOperator string
+
+const (
+	SetOperatorUnion     SetOperator = "union"
+	SetOperatorIntersect SetOperator = "intersect"
+	SetOperatorExcept    SetOperator = "except"
+)
+
+type SetBranch struct {
+	Operator SetOperator `json:"operator"`
+	Ordinal  int         `json:"ordinal"`
+	All      bool        `json:"all"`
 }
 
 type OutputColumnKind string
@@ -217,9 +232,17 @@ type SetOperationFact struct {
 }
 
 type SetOperationBranchFact struct {
-	Index       int              `json:"index"`
-	Projections []ProjectionFact `json:"projections"`
+	Index       int                    `json:"index"`
+	Role        SetOperationBranchRole `json:"role"`
+	Projections []ProjectionFact       `json:"projections"`
 }
+
+type SetOperationBranchRole string
+
+const (
+	SetOperationBranchRoleValue  SetOperationBranchRole = "value"
+	SetOperationBranchRoleFilter SetOperationBranchRole = "filter"
+)
 
 type RenameTablesOptions struct {
 	AliasRenamedTables      *bool `json:"aliasRenamedTables,omitempty"`

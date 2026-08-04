@@ -328,6 +328,9 @@ fmt.Println(analysis.BaseTables[0].Name)                  // orders
 derived table, virtual source, or unknown. `LineageNode.SourceAlias` is set for
 physical table aliases such as `orders AS o` and virtual sources such as
 BigQuery `UNNEST(...) AS alias`.
+Immediate set-operation branch roots expose `LineageNode.SetBranch` with the
+operator, original zero-based branch ordinal, and `ALL` flag. Branch-local
+resolution failures do not renumber surviving nodes.
 
 For `AnalyzeQuery`, `Relations` reports sources visible in the analyzed scope.
 `BaseTables` reports deduplicated physical table dependencies across nested CTEs,
@@ -337,6 +340,8 @@ schema type strings for projection `TypeHint` values. `CTEFacts` reports
 top-level CTE definitions, `StarProjections` records original star projections
 and schema-expanded columns, and `ProjectionFact.Nullability` is one of
 `non_null`, `nullable`, or `unknown`.
+Each `SetOperationBranchFact.Role` is `value` for value-producing branches or
+`filter` for the right branch of `EXCEPT` and `INTERSECT`.
 
 ### OpenLineage
 
@@ -348,6 +353,9 @@ and schema-expanded columns, and `ProjectionFact.Nullability` is one of
 
 The SDK builds OpenLineage-compatible payloads only. Transport and client
 emission are intentionally out of scope.
+Set-operation queries classify both `UNION` inputs as direct dependencies and
+the right input of `EXCEPT` or `INTERSECT` as an indirect `FILTER` dependency.
+One input field can contain both transformations when both roles reach it.
 
 ```go
 options := polyglot.OpenLineageOptions{
@@ -402,6 +410,7 @@ fmt.Println(columnLineage.Facet.Fields, jobEvent.Event, runEvent.Event)
 | `ColumnReferenceFact` | `SourceName`, `SourceAlias`, `SourceKind`, `Table`, `Column`, `Unqualified`, `Confidence` |
 | `RelationFact` | `Name`, `Alias`, `Kind`, `Columns`, `Catalog`, `Schema`, `Table` |
 | `SetOperationFact` | `Kind`, `All`, `Distinct`, `OutputColumns`, `Branches` |
+| `SetOperationBranchFact` | `Index`, `Role`, `Projections` |
 | `ValidationResult` | `Valid`, `Errors` |
 | `ValidationError` | `Message`, `Line`, `Column`, `Severity`, `Code`, `Start`, `End` |
 | `ValidationOptions` | `StrictSyntax`, `Semantic` |
@@ -442,7 +451,8 @@ FFI, and TypeScript:
 
 Use the `type` JSON key for column types. `dataType` / `data_type` are not
 accepted aliases in this payload.
-| `LineageNode` | `Name`, `Expression`, `Source`, `Downstream`, `SourceName`, `SourceKind`, `SourceAlias`, `ReferenceNodeName` |
+| `LineageNode` | `Name`, `Expression`, `Source`, `Downstream`, `SourceName`, `SourceKind`, `SourceAlias`, `SetBranch`, `ReferenceNodeName` |
+| `SetBranch` | `Operator`, `Ordinal`, `All` |
 | `QualifyTablesOptions` | `DB`, `Catalog`, `Dialect`, `CanonicalizeTableAliases`, `AliasUnaliasedTables`, `AliasUnaliasedSubqueries`, `AliasPrefix`, `NormalizeSetOperationSubqueries` |
 | `RenameTablesOptions` | `AliasRenamedTables`, `PreserveExistingAliases` |
 | `OpenLineageOptions` | `Dialect`, `Producer`, `DatasetNamespace`, `DatasetMappings`, `OutputDataset`, `Schema`, `JobNamespace`, `JobName`, `EventTime`, `RunID`, `EventType` |

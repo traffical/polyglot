@@ -281,8 +281,11 @@ export interface RelationFact {
 
 export interface SetOperationBranchFact {
   index: number;
+  role: SetOperationBranchRole;
   projections: ProjectionFact[];
 }
+
+export type SetOperationBranchRole = 'value' | 'filter';
 
 export interface SetOperationFact {
   kind: 'union' | 'intersect' | 'except' | string;
@@ -1141,6 +1144,8 @@ export type {
   OutputColumn,
   QueryOutput,
   QueryOutputResult,
+  SetBranch,
+  SetOperator,
   SourceTablesResult,
 } from './lineage';
 // Re-export lineage module

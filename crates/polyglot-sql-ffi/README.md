@@ -136,6 +136,8 @@ typedef struct {
   reports top-level CTE definitions, `starProjections` records original star
   projections and schema-expanded columns, and each projection includes
   conservative `nullability`: `"non_null"`, `"nullable"`, or `"unknown"`.
+  Each `setOperations[].branches[]` entry includes a `role` of `"value"` or
+  `"filter"`.
 - `polyglot_openlineage_column_lineage(sql, options_json)` (`OpenLineageOptions` JSON)
 - `polyglot_openlineage_job_event(sql, options_json)` (`OpenLineageOptions` JSON)
 - `polyglot_openlineage_run_event(sql, options_json)` (`OpenLineageOptions` JSON)
@@ -247,6 +249,9 @@ aliases in this payload.
 `LineageNode` includes `source_kind` and optional `source_alias` metadata so
 wrappers can distinguish physical table sources from virtual sources such as
 BigQuery `UNNEST(...) AS alias`.
+Immediate set-operation branch roots also include optional `set_branch`
+metadata: `operator`, the original zero-based `ordinal`, and the operation's
+`all` flag. Branch-local resolution failures do not renumber surviving nodes.
 
 `QueryOutput.columns` is ordered and uses tagged `named`, `unnamed`, and
 `wildcard` entries. Each concrete entry carries a zero-based `ordinal` when it

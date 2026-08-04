@@ -523,6 +523,20 @@ func TestIntegrationCoreAPIs(t *testing.T) {
 		t.Fatalf("unexpected AnalyzeQuery nested set upstream: %#v", setUpstream)
 	}
 
+	analysis, err = client.AnalyzeQuery(
+		"SELECT a FROM x EXCEPT SELECT b FROM y",
+		AnalyzeQueryOptions{Dialect: "generic"},
+	)
+	if err != nil {
+		t.Fatalf("AnalyzeQuery set-operation roles: %v", err)
+	}
+	if len(analysis.SetOperations) != 1 ||
+		len(analysis.SetOperations[0].Branches) != 2 ||
+		analysis.SetOperations[0].Branches[0].Role != SetOperationBranchRoleValue ||
+		analysis.SetOperations[0].Branches[1].Role != SetOperationBranchRoleFilter {
+		t.Fatalf("unexpected AnalyzeQuery set-operation roles: %#v", analysis.SetOperations)
+	}
+
 	unnestSchema := ValidationSchema{
 		Tables: []SchemaTable{
 			{Name: "t", Columns: []SchemaColumn{{Name: "arr", Type: "INT"}}},
@@ -719,6 +733,15 @@ func TestIntegrationLineageAndOpenLineage(t *testing.T) {
 	ordinalNames := collectLineageNames(ordinalNode)
 	if !containsString(ordinalNames, "t1.b") || !containsString(ordinalNames, "t2.y") {
 		t.Fatalf("unexpected ordinal lineage: %#v", ordinalNames)
+	}
+	if len(ordinalNode.Downstream) != 2 ||
+		ordinalNode.Downstream[0].SetBranch == nil ||
+		ordinalNode.Downstream[0].SetBranch.Operator != SetOperatorUnion ||
+		ordinalNode.Downstream[0].SetBranch.Ordinal != 0 ||
+		!ordinalNode.Downstream[0].SetBranch.All ||
+		ordinalNode.Downstream[1].SetBranch == nil ||
+		ordinalNode.Downstream[1].SetBranch.Ordinal != 1 {
+		t.Fatalf("unexpected ordinal lineage branch metadata: %#v", ordinalNode.Downstream)
 	}
 
 	_, err = client.LineageAt(2, "SELECT a FROM t", "generic")

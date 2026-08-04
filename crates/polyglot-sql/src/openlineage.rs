@@ -6,7 +6,7 @@
 
 use crate::dialects::{Dialect, DialectType};
 use crate::expressions::*;
-use crate::lineage::{self, LineageNode};
+use crate::lineage::{self, LineageNode, SetOperator};
 use crate::schema::Schema;
 use crate::scope::SourceKind;
 use crate::traversal::ExpressionWalk;
@@ -180,6 +180,13 @@ struct OutputField {
 struct TerminalField {
     table: String,
     field: String,
+    dependency: TerminalDependency,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TerminalDependency {
+    Direct,
+    Filter,
 }
 
 /// Produce a standalone OpenLineage columnLineage facet plus inferred datasets.
@@ -386,6 +393,23 @@ fn analyze_statement(
                 output_column_names: Vec::new(),
             })
         }
+        Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_) => {
+            let output = options.output_dataset.clone().ok_or_else(|| {
+                Error::parse(
+                    "OpenLineage outputDataset is required for set-operation queries",
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+            })?;
+            Ok(StatementAnalysis {
+                query: expr.clone(),
+                inputs: collect_input_datasets(expr, options, Some(&output), warnings)?,
+                output,
+                output_column_names: Vec::new(),
+            })
+        }
         Expression::Insert(insert) => {
             let output = dataset_from_table_ref(&insert.table, options)?;
             let query = insert.query.clone().ok_or_else(|| {
@@ -494,6 +518,7 @@ fn input_fields_for_output(
             vec![TerminalField {
                 table: table.clone(),
                 field: output_field.lineage_name.clone(),
+                dependency: TerminalDependency::Direct,
             }],
             "IDENTITY",
             Some(format!("SELECT {}", output_field.lineage_name)),
@@ -534,7 +559,7 @@ fn input_fields_for_output(
     };
 
     let mut terminals = BTreeSet::new();
-    collect_terminal_fields(&node, &mut terminals);
+    collect_terminal_fields(&node, TerminalDependency::Direct, &mut terminals);
     let terminals: Vec<TerminalField> = terminals.into_iter().collect();
 
     if terminals.is_empty() {
@@ -580,7 +605,8 @@ fn terminal_fields_to_openlineage(
     options: &OpenLineageOptions,
     warnings: &mut Vec<OpenLineageWarning>,
 ) -> Result<Vec<OpenLineageInputField>> {
-    let mut result = Vec::new();
+    let mut grouped =
+        BTreeMap::<(String, String, String), BTreeSet<OpenLineageTransformation>>::new();
     for terminal in terminals {
         let dataset = dataset_from_table_name(&terminal.table, options).map_err(|err| {
             warnings.push(OpenLineageWarning::new(
@@ -592,19 +618,31 @@ fn terminal_fields_to_openlineage(
             ));
             err
         })?;
-        result.push(OpenLineageInputField {
-            namespace: dataset.namespace,
-            name: dataset.name,
-            field: terminal.field,
-            transformations: vec![OpenLineageTransformation {
-                type_: "DIRECT".to_string(),
-                subtype: subtype.to_string(),
+        let (type_, transformation_subtype) = match terminal.dependency {
+            TerminalDependency::Direct => ("DIRECT", subtype),
+            TerminalDependency::Filter => ("INDIRECT", "FILTER"),
+        };
+        grouped
+            .entry((dataset.namespace, dataset.name, terminal.field))
+            .or_default()
+            .insert(OpenLineageTransformation {
+                type_: type_.to_string(),
+                subtype: transformation_subtype.to_string(),
                 description: description.clone(),
                 masking: Some(false),
-            }],
-        });
+            });
     }
-    Ok(result)
+    Ok(grouped
+        .into_iter()
+        .map(
+            |((namespace, name, field), transformations)| OpenLineageInputField {
+                namespace,
+                name,
+                field,
+                transformations: transformations.into_iter().collect(),
+            },
+        )
+        .collect())
 }
 
 fn transformation_subtype(expr: Option<&Expression>, terminals: &[TerminalField]) -> &'static str {
@@ -615,7 +653,11 @@ fn transformation_subtype(expr: Option<&Expression>, terminals: &[TerminalField]
     if expression_contains_aggregate(unaliased) {
         return "AGGREGATION";
     }
-    if terminals.len() == 1 {
+    let distinct_fields = terminals
+        .iter()
+        .map(|terminal| (&terminal.table, &terminal.field))
+        .collect::<BTreeSet<_>>();
+    if distinct_fields.len() == 1 {
         if let Expression::Column(col) = unaliased {
             if col.name.name == terminals[0].field {
                 return "IDENTITY";
@@ -625,7 +667,23 @@ fn transformation_subtype(expr: Option<&Expression>, terminals: &[TerminalField]
     "TRANSFORMATION"
 }
 
-fn collect_terminal_fields(node: &LineageNode, terminals: &mut BTreeSet<TerminalField>) {
+fn collect_terminal_fields(
+    node: &LineageNode,
+    inherited_dependency: TerminalDependency,
+    terminals: &mut BTreeSet<TerminalField>,
+) {
+    let dependency = if inherited_dependency == TerminalDependency::Filter
+        || matches!(
+            node.set_branch,
+            Some(branch)
+                if branch.ordinal == 1
+                    && matches!(branch.operator, SetOperator::Intersect | SetOperator::Except)
+        ) {
+        TerminalDependency::Filter
+    } else {
+        TerminalDependency::Direct
+    };
+
     if node.downstream.is_empty() {
         if node.source_kind == SourceKind::Virtual {
             return;
@@ -642,6 +700,7 @@ fn collect_terminal_fields(node: &LineageNode, terminals: &mut BTreeSet<Terminal
                 terminals.insert(TerminalField {
                     table,
                     field: column.name.name.clone(),
+                    dependency,
                 });
             }
         }
@@ -649,7 +708,7 @@ fn collect_terminal_fields(node: &LineageNode, terminals: &mut BTreeSet<Terminal
     }
 
     for child in &node.downstream {
-        collect_terminal_fields(child, terminals);
+        collect_terminal_fields(child, dependency, terminals);
     }
 }
 
@@ -1117,6 +1176,83 @@ mod tests {
         assert_eq!(field.input_fields[0].name, "t");
         assert_eq!(field.input_fields[0].field, "a");
         assert_eq!(field.input_fields[0].transformations[0].subtype, "IDENTITY");
+    }
+
+    #[test]
+    fn emits_set_operation_value_and_filter_dependencies() {
+        let union = openlineage_column_lineage(
+            "SELECT a FROM left_table UNION ALL SELECT b FROM right_table",
+            &options(),
+        )
+        .expect("union lineage");
+        let union_field = union.facet.fields.get("a").expect("union field");
+        assert_eq!(union_field.input_fields.len(), 2);
+        assert!(union_field.input_fields.iter().all(|input| input
+            .transformations
+            .iter()
+            .all(|transformation| transformation.type_ == "DIRECT")));
+
+        for operator in ["EXCEPT", "INTERSECT"] {
+            let result = openlineage_column_lineage(
+                &format!("SELECT a FROM left_table {operator} SELECT b FROM right_table"),
+                &options(),
+            )
+            .unwrap_or_else(|error| panic!("{operator} lineage failed: {error}"));
+            let field = result.facet.fields.get("a").expect("output field");
+            let left = field
+                .input_fields
+                .iter()
+                .find(|input| input.name == "left_table")
+                .expect("left input");
+            let right = field
+                .input_fields
+                .iter()
+                .find(|input| input.name == "right_table")
+                .expect("right input");
+            assert!(left
+                .transformations
+                .iter()
+                .all(|transformation| transformation.type_ == "DIRECT"));
+            assert!(right.transformations.iter().any(|transformation| {
+                transformation.type_ == "INDIRECT" && transformation.subtype == "FILTER"
+            }));
+        }
+
+        let merged = openlineage_column_lineage(
+            "SELECT a FROM shared_table EXCEPT SELECT a FROM shared_table",
+            &options(),
+        )
+        .expect("merged dependency lineage");
+        let merged_field = merged.facet.fields.get("a").expect("merged field");
+        assert_eq!(merged_field.input_fields.len(), 1);
+        assert!(merged_field.input_fields[0]
+            .transformations
+            .iter()
+            .any(|transformation| transformation.type_ == "DIRECT"));
+        assert!(merged_field.input_fields[0]
+            .transformations
+            .iter()
+            .any(|transformation| {
+                transformation.type_ == "INDIRECT" && transformation.subtype == "FILTER"
+            }));
+
+        let nested = openlineage_column_lineage(
+            "SELECT a FROM left_table EXCEPT \
+             (SELECT b FROM right_table UNION ALL SELECT c FROM third_table)",
+            &options(),
+        )
+        .expect("nested set-operation lineage");
+        let nested_field = nested.facet.fields.get("a").expect("nested field");
+        for table in ["right_table", "third_table"] {
+            let input = nested_field
+                .input_fields
+                .iter()
+                .find(|input| input.name == table)
+                .unwrap_or_else(|| panic!("missing nested input {table}"));
+            assert!(input.transformations.iter().any(|transformation| {
+                transformation.type_ == "INDIRECT" && transformation.subtype == "FILTER"
+            }));
+        }
     }
 
     #[test]

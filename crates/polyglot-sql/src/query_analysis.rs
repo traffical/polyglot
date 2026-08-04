@@ -138,7 +138,16 @@ pub struct SetOperationFact {
 #[serde(rename_all = "camelCase")]
 pub struct SetOperationBranchFact {
     pub index: usize,
+    pub role: SetOperationBranchRole,
     pub projections: Vec<ProjectionFact>,
+}
+
+/// Semantic contribution of one set-operation branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetOperationBranchRole {
+    Value,
+    Filter,
 }
 
 /// High-level kind of transformation performed by a projection.
@@ -1413,7 +1422,13 @@ fn collect_set_operation_facts(
                 all: union.all,
                 distinct: union.distinct,
                 output_columns: get_output_column_names(expression),
-                branches: set_operation_branches(&union.left, &union.right, scope, dialect),
+                branches: set_operation_branches(
+                    &union.left,
+                    &union.right,
+                    scope,
+                    dialect,
+                    SetOperationBranchRole::Value,
+                ),
             });
             collect_set_operation_facts(&union.left, scope, dialect, facts);
             collect_set_operation_facts(&union.right, scope, dialect, facts);
@@ -1424,7 +1439,13 @@ fn collect_set_operation_facts(
                 all: intersect.all,
                 distinct: intersect.distinct,
                 output_columns: get_output_column_names(expression),
-                branches: set_operation_branches(&intersect.left, &intersect.right, scope, dialect),
+                branches: set_operation_branches(
+                    &intersect.left,
+                    &intersect.right,
+                    scope,
+                    dialect,
+                    SetOperationBranchRole::Filter,
+                ),
             });
             collect_set_operation_facts(&intersect.left, scope, dialect, facts);
             collect_set_operation_facts(&intersect.right, scope, dialect, facts);
@@ -1435,7 +1456,13 @@ fn collect_set_operation_facts(
                 all: except.all,
                 distinct: except.distinct,
                 output_columns: get_output_column_names(expression),
-                branches: set_operation_branches(&except.left, &except.right, scope, dialect),
+                branches: set_operation_branches(
+                    &except.left,
+                    &except.right,
+                    scope,
+                    dialect,
+                    SetOperationBranchRole::Filter,
+                ),
             });
             collect_set_operation_facts(&except.left, scope, dialect, facts);
             collect_set_operation_facts(&except.right, scope, dialect, facts);
@@ -1452,14 +1479,17 @@ fn set_operation_branches(
     right: &Expression,
     scope: &Scope,
     dialect: DialectType,
+    right_role: SetOperationBranchRole,
 ) -> Vec<SetOperationBranchFact> {
     vec![
         SetOperationBranchFact {
             index: 0,
+            role: SetOperationBranchRole::Value,
             projections: projection_facts_for_branch(left, scope, dialect),
         },
         SetOperationBranchFact {
             index: 1,
+            role: right_role,
             projections: projection_facts_for_branch(right, scope, dialect),
         },
     ]

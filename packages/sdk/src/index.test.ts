@@ -432,6 +432,12 @@ describe('Polyglot SDK', () => {
       expect(collectNames(result.lineage!)).toEqual(
         expect.arrayContaining(['t1.b', 't2.y']),
       );
+      expect(result.lineage?.downstream.map((node) => node.set_branch)).toEqual(
+        [
+          { operator: 'union', ordinal: 0, all: true },
+          { operator: 'union', ordinal: 1, all: true },
+        ],
+      );
     });
 
     it('should expose structured ordinal resolution failures', () => {
@@ -474,6 +480,20 @@ describe('Polyglot SDK', () => {
         transformKind: 'direct',
       });
       expect(result.analysis?.projections[0].upstream[0].column).toBe('a');
+    });
+
+    it('should expose set-operation branch roles', () => {
+      const union = analyzeQuery('SELECT a FROM x UNION SELECT b FROM y');
+      const except = analyzeQuery('SELECT a FROM x EXCEPT SELECT b FROM y');
+
+      expect(union.success).toBe(true);
+      expect(
+        union.analysis?.setOperations[0].branches.map(({ role }) => role),
+      ).toEqual(['value', 'value']);
+      expect(except.success).toBe(true);
+      expect(
+        except.analysis?.setOperations[0].branches.map(({ role }) => role),
+      ).toEqual(['value', 'filter']);
     });
 
     it('should expose full compact analysis facts with schema', () => {

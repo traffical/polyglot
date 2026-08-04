@@ -25,12 +25,12 @@ By default, `polyglot-sql` enables the full public API. Parser-only consumers ca
 disable default features and opt into only the dialect parsers they need:
 
 ```toml
-polyglot-sql = { version = "0.7.0", default-features = false }
+polyglot-sql = { version = "0.8.0", default-features = false }
 ```
 
 ```toml
 polyglot-sql = {
-    version = "0.5",
+    version = "0.8.0",
     default-features = false,
     features = ["dialect-clickhouse"],
 }
@@ -44,14 +44,14 @@ Examples:
 ```toml
 # Parse and generate SQL for one dialect.
 polyglot-sql = {
-    version = "0.5",
+    version = "0.8.0",
     default-features = false,
     features = ["generate", "dialect-clickhouse"],
 }
 
 # Cross-dialect transpilation.
 polyglot-sql = {
-    version = "0.5",
+    version = "0.8.0",
     default-features = false,
     features = ["transpile", "dialect-clickhouse", "dialect-postgresql"],
 }
@@ -332,6 +332,13 @@ and CTE output columns. `star_projections` reports the original top-level star
 projection index, optional table qualifier, and schema-expanded columns when
 known. Each projection also includes conservative `nullability`:
 `non_null`, `nullable`, or `unknown`.
+Each `set_operations` branch includes a semantic `role`: both `UNION` branches
+are `value`, while the right branch of `EXCEPT` and `INTERSECT` is `filter`.
+
+Lineage nodes at immediate set-operation branch roots expose optional
+`set_branch` metadata with the operator, original zero-based branch ordinal,
+and `ALL` flag. The ordinal remains stable when another branch cannot be
+resolved.
 
 ```rust
 use polyglot_sql::{

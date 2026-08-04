@@ -98,7 +98,7 @@ pub use helper::{
 #[cfg(feature = "semantic")]
 pub use lineage::{
     lineage, lineage_at, lineage_at_with_schema, lineage_with_schema, output_columns,
-    output_columns_with_schema, LineageNode, OutputColumn, QueryOutput,
+    output_columns_with_schema, LineageNode, OutputColumn, QueryOutput, SetBranch, SetOperator,
 };
 #[cfg(feature = "semantic")]
 pub use optimizer::{
@@ -109,8 +109,8 @@ pub use parser::Parser;
 pub use query_analysis::{
     analyze_query, AnalyzeQueryOptions, ColumnReferenceFact, CteFact, ProjectionFact,
     ProjectionNullability, QueryAnalysis, QueryShape, ReferenceConfidence, RelationFact,
-    SetOperationBranchFact, SetOperationFact, StarProjectionFact, TransformFunctionFact,
-    TransformKind,
+    SetOperationBranchFact, SetOperationBranchRole, SetOperationFact, StarProjectionFact,
+    TransformFunctionFact, TransformKind,
 };
 #[cfg(feature = "semantic")]
 pub use resolver::{is_column_ambiguous, resolve_column, Resolver, ResolverError, ResolverResult};

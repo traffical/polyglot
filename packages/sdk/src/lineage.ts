@@ -25,6 +25,14 @@ export type LineageSourceKind =
   | 'virtual'
   | 'unknown';
 
+export type SetOperator = 'union' | 'intersect' | 'except';
+
+export interface SetBranch {
+  operator: SetOperator;
+  ordinal: number;
+  all: boolean;
+}
+
 /** A node in the column lineage tree */
 export interface LineageNode {
   name: string;
@@ -34,6 +42,7 @@ export interface LineageNode {
   source_name: string;
   source_kind: LineageSourceKind;
   source_alias?: string;
+  set_branch?: SetBranch;
   reference_node_name: string;
 }
 

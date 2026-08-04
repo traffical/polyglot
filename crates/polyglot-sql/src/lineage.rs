@@ -55,6 +55,27 @@ pub enum OutputColumn {
     },
 }
 
+/// The set operator that owns an immediate lineage branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetOperator {
+    Union,
+    Intersect,
+    Except,
+}
+
+/// Metadata describing a lineage node's position in an immediate set operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetBranch {
+    /// The set operator that owns this branch.
+    pub operator: SetOperator,
+    /// The zero-based branch ordinal within the immediate binary operation.
+    pub ordinal: usize,
+    /// Whether the immediate set operation uses `ALL` semantics.
+    pub all: bool,
+}
+
 /// A node in the column lineage graph
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LineageNode {
@@ -73,6 +94,9 @@ pub struct LineageNode {
     /// User-written source alias when different from canonical source name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_alias: Option<String>,
+    /// Immediate set-operation branch metadata, when this node is a branch root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_branch: Option<SetBranch>,
     /// Optional reference node name (e.g., for CTEs)
     pub reference_node_name: String,
 }
@@ -88,6 +112,7 @@ impl LineageNode {
             source_name: String::new(),
             source_kind: SourceKind::Unknown,
             source_alias: None,
+            set_branch: None,
             reference_node_name: String::new(),
         }
     }
@@ -1314,6 +1339,27 @@ fn query_expressions_in_scope(expr: &Expression) -> Vec<&Expression> {
 // Set operation handling
 // ---------------------------------------------------------------------------
 
+fn set_branch_metadata(expression: &Expression, ordinal: usize) -> SetBranch {
+    match expression {
+        Expression::Union(union) => SetBranch {
+            operator: SetOperator::Union,
+            ordinal,
+            all: union.all,
+        },
+        Expression::Intersect(intersect) => SetBranch {
+            operator: SetOperator::Intersect,
+            ordinal,
+            all: intersect.all,
+        },
+        Expression::Except(except) => SetBranch {
+            operator: SetOperator::Except,
+            ordinal,
+            all: except.all,
+        },
+        _ => unreachable!("set-operation metadata requires a set operation"),
+    }
+}
+
 fn handle_set_operation(
     column: &ColumnRef<'_>,
     context: &LineageScopeContext,
@@ -1361,7 +1407,9 @@ fn handle_set_operation(
 
     // Recurse into each set-operation branch. Resolution failures are branch-local,
     // but genuine parser/internal errors must not be silently discarded.
-    for &branch_scope_id in &context.indexed(scope_id).union_scopes {
+    for (branch_ordinal, &branch_scope_id) in
+        context.indexed(scope_id).union_scopes.iter().enumerate()
+    {
         let branch_column = if trace_wildcard_by_name {
             match column {
                 ColumnRef::Name(name) => ColumnRef::Name(name),
@@ -1383,7 +1431,10 @@ fn handle_set_operation(
             ancestor_cte_scopes,
             depth + 1,
         ) {
-            Ok(child) => node.downstream.push(child),
+            Ok(mut child) => {
+                child.set_branch = Some(set_branch_metadata(scope_expr, branch_ordinal));
+                node.downstream.push(child);
+            }
             Err(Error::ColumnResolution { reason, .. }) => {
                 resolution_failure = Some(merge_resolution_reason(resolution_failure, reason));
             }
@@ -4224,6 +4275,7 @@ select col_a from unioned";
             source_name: String::new(),
             source_kind: SourceKind::Unknown,
             source_alias: None,
+            set_branch: None,
             reference_node_name: String::new(),
         };
 
@@ -5488,6 +5540,31 @@ FROM t JOIN UNNEST(t.items) AS item ON TRUE
 
         assert_lineage_contains(&node, "known_source.known_second");
         assert_eq!(node.downstream.len(), 1);
+        assert_eq!(
+            node.downstream[0].set_branch,
+            Some(SetBranch {
+                operator: SetOperator::Union,
+                ordinal: 1,
+                all: true,
+            })
+        );
+
+        let expr = parse(
+            "SELECT known_first, known_second FROM known_source EXCEPT \
+             SELECT * FROM unknown_source",
+        );
+        let node = lineage_at(1, &expr, None, false).expect("left-only ordinal lineage");
+
+        assert_lineage_contains(&node, "known_source.known_second");
+        assert_eq!(node.downstream.len(), 1);
+        assert_eq!(
+            node.downstream[0].set_branch,
+            Some(SetBranch {
+                operator: SetOperator::Except,
+                ordinal: 0,
+                all: false,
+            })
+        );
     }
 
     #[test]
@@ -5519,16 +5596,38 @@ FROM t JOIN UNNEST(t.items) AS item ON TRUE
 
     #[test]
     fn test_issue_383_lineage_at_supports_all_set_operations() {
-        for operator in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+        for (sql_operator, operator, all) in [
+            ("UNION ALL", SetOperator::Union, true),
+            ("INTERSECT", SetOperator::Intersect, false),
+            ("EXCEPT", SetOperator::Except, false),
+        ] {
             let expr = parse(&format!(
-                "SELECT left_value AS left_name FROM left_source {operator} \
+                "SELECT left_value AS left_name FROM left_source {sql_operator} \
                  SELECT right_value AS right_name FROM right_source"
             ));
             let node = lineage_at(0, &expr, None, false).expect("ordinal lineage");
             assert_eq!(
                 node.downstream.len(),
                 2,
-                "expected both branches for {operator}"
+                "expected both branches for {sql_operator}"
+            );
+            assert_eq!(
+                node.downstream
+                    .iter()
+                    .map(|child| child.set_branch)
+                    .collect::<Vec<_>>(),
+                vec![
+                    Some(SetBranch {
+                        operator,
+                        ordinal: 0,
+                        all,
+                    }),
+                    Some(SetBranch {
+                        operator,
+                        ordinal: 1,
+                        all,
+                    }),
+                ]
             );
         }
     }

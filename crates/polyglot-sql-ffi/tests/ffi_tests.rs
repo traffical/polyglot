@@ -848,6 +848,11 @@ fn test_lineage_at_traces_set_operation_by_zero_based_ordinal() {
     collect_lineage_names(&node, &mut names);
     assert!(names.iter().any(|name| name == "t1.b"));
     assert!(names.iter().any(|name| name == "t2.y"));
+    assert_eq!(node["downstream"][0]["set_branch"]["operator"], "union");
+    assert_eq!(node["downstream"][0]["set_branch"]["ordinal"], 0);
+    assert_eq!(node["downstream"][0]["set_branch"]["all"], true);
+    assert_eq!(node["downstream"][1]["set_branch"]["operator"], "union");
+    assert_eq!(node["downstream"][1]["set_branch"]["ordinal"], 1);
 }
 
 #[test]

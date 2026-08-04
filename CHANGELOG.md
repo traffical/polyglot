@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.8.0] - 2026-08-04
+
+### Added
+- Set-operation lineage branch roots now expose structured metadata with the
+  operator, original zero-based branch ordinal, and `ALL` flag across Rust,
+  FFI, Python, WASM/TypeScript, and Go.
+- Compact query analysis classifies set-operation branches as `value` or
+  `filter` contributions.
+
+### Changed
+- OpenLineage generation now supports top-level set-operation queries. Both
+  `UNION` inputs remain direct dependencies, while right-hand `EXCEPT` and
+  `INTERSECT` inputs use indirect `FILTER` transformations. A shared input field
+  can contain both transformations.
+- Rust callers that construct `LineageNode` with a struct literal must
+  initialize the new optional `set_branch` field.
+
+### Fixed
+- Partial set-operation lineage no longer compresses branch positions when one
+  branch cannot be resolved, so surviving lineage nodes retain their original
+  ordinal.
+
 ## [0.7.0] - 2026-08-03
 
 ### Added

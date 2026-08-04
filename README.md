@@ -170,11 +170,15 @@ Polyglot can trace column lineage through SQL queries and can generate
 OpenLineage-compatible JSON payloads from that analysis. The OpenLineage support
 currently produces `columnLineage` dataset facets, optional schema facets, and
 `JobEvent` / `RunEvent` payloads for supported query shapes such as `SELECT`,
-`INSERT ... SELECT`, and `CREATE TABLE AS SELECT`.
+set-operation queries, `INSERT ... SELECT`, and `CREATE TABLE AS SELECT`.
 
 Lineage can be selected by output name or by zero-based output ordinal. Ordered
 output metadata preserves unnamed projections and unresolved wildcards, so
 callers can decide whether a positional lookup is complete before tracing it.
+Immediate set-operation branch roots include the operator, original zero-based
+branch ordinal, and `ALL` flag. For OpenLineage, both `UNION` branches are
+direct value dependencies; the right branch of `EXCEPT` and `INTERSECT` is an
+indirect `FILTER` dependency.
 
 OpenLineage transport and client emission are intentionally out of scope:
 Polyglot builds payloads for callers to inspect, persist, or send through their
@@ -193,6 +197,7 @@ names and top-level `cteFacts`, original `starProjections`, set-operation
 branches, transform kinds, conservative projection `nullability`, optional type
 hints, and upstream column references. The API is additive and uses the same
 optional `ValidationSchema` shape as schema-aware validation and lineage.
+Each set-operation branch is classified as a `value` or `filter` contribution.
 Validation uses broad type families, while query analysis preserves detailed
 schema type strings such as `DECIMAL(10,2)` for `typeHint` values when they can
 be parsed.
@@ -281,7 +286,7 @@ If you want to disable `stacker` for a native Rust build, turn off default featu
 
 ```toml
 [dependencies]
-polyglot-sql = { version = "0.7.0", default-features = false, features = ["all-dialects", "transpile"] }
+polyglot-sql = { version = "0.8.0", default-features = false, features = ["all-dialects", "transpile"] }
 ```
 
 That can reduce overhead slightly on trusted inputs, but you lose the default stack-growth protection for deeply nested SQL.
@@ -400,14 +405,14 @@ Polyglot currently runs **11,333 SQLGlot fixture cases** plus additional project
 | SQLGlot transpile (generic) | 154 | 100% |
 | SQLGlot parser | 32 | 100% |
 | SQLGlot pretty-print | 23 | 100% |
-| Lib unit tests (non-ignored) | 1,141 | 100% |
+| Lib unit tests (non-ignored) | 1,142 | 100% |
 | Custom dialect identity | 276 | 100% |
 | Custom dialect transpilation | 347 | 100% |
 | ClickHouse parser corpus (non-skipped) | 9,417 | 100% |
 | ClickHouse normalized round trips (in-scope) | 121,020 | 100% |
 | FFI integration tests | 66 | 100% |
 | Python bindings tests (non-skipped) | 169 | 100% |
-| **Total (strict Rust/FFI pass/fail case count)** | **143,600** | **100%** |
+| **Total (strict Rust/FFI pass/fail case count)** | **143,601** | **100%** |
 
 One Rust unit test is ignored, one Python compatibility test is skipped, and 172 out-of-scope KQL/non-SQL ClickHouse fixtures are excluded from the strict counts.
 
@@ -417,8 +422,8 @@ make setup-fixtures
 
 # Run all tests
 make test-rust-all          # All 11,333 SQLGlot fixture cases
-make test-rust-lib          # 1,141 active lib unit tests (1 ignored)
-make test-rust-verify       # All 143,600 strict Rust/FFI cases
+make test-rust-lib          # 1,142 active lib unit tests (1 ignored)
+make test-rust-verify       # All 143,601 strict Rust/FFI cases
 make test-ffi               # 66 FFI integration tests
 make test-python            # 169 active Python tests (1 skipped)
 

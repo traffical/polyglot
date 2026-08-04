@@ -140,6 +140,16 @@ def test_lineage_at_traces_set_operation_by_zero_based_ordinal():
     names = collect_names(result)
     assert "t1.b" in names
     assert "t2.y" in names
+    assert result["downstream"][0]["set_branch"] == {
+        "operator": "union",
+        "ordinal": 0,
+        "all": True,
+    }
+    assert result["downstream"][1]["set_branch"] == {
+        "operator": "union",
+        "ordinal": 1,
+        "all": True,
+    }
 
 
 def test_lineage_at_raises_structured_resolution_error():

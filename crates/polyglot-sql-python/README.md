@@ -150,6 +150,13 @@ Function-like projections may include `transformFunction` with the function
 name, literal arguments, and column arguments, for example for
 `DATE_TRUNC('month', created_at)`.
 
+Each `analysis["setOperations"][...]["branches"]` entry includes a `role` of
+`"value"` or `"filter"`. Lineage results attach optional `set_branch` metadata
+to immediate set-operation branch roots with the `operator`, original
+zero-based `ordinal`, and `all` flag; omitted branches do not renumber the
+surviving nodes. In OpenLineage output, `EXCEPT` and `INTERSECT` right-hand
+inputs are emitted as indirect `FILTER` dependencies.
+
 Validation schema dictionaries use:
 
 ```python
