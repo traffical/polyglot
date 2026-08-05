@@ -26,6 +26,15 @@ use std::collections::HashMap;
 /// T-SQL (SQL Server) dialect
 pub struct TSQLDialect;
 
+enum PostgresToCharFormat {
+    Numeric,
+    Temporal {
+        strftime: String,
+        requires_english_culture: bool,
+    },
+    Unsupported,
+}
+
 impl DialectImpl for TSQLDialect {
     fn dialect_type(&self) -> DialectType {
         DialectType::TSQL
@@ -39,6 +48,7 @@ impl DialectImpl for TSQLDialect {
         config.identifiers.insert('"', '"');
         // SQL Server uses 0x-prefixed binary/varbinary hex literals.
         config.hex_number_strings = true;
+        config.allow_empty_hex_string = true;
         config
     }
 
@@ -3115,29 +3125,6 @@ impl TSQLDialect {
         }
     }
 
-    fn is_postgres_numeric_to_char_format(format: &str) -> bool {
-        let mut unquoted = String::with_capacity(format.len());
-        let mut quoted = false;
-        let mut chars = format.chars().peekable();
-
-        while let Some(ch) = chars.next() {
-            if ch == '"' {
-                if quoted && chars.peek() == Some(&'"') {
-                    chars.next();
-                } else {
-                    quoted = !quoted;
-                }
-            } else if !quoted {
-                unquoted.extend(ch.to_uppercase());
-            }
-        }
-
-        unquoted.contains(['9', '0'])
-            || ["PR", "SG", "PL", "RN", "EEEE"]
-                .iter()
-                .any(|token| unquoted.contains(token))
-    }
-
     fn postgres_format_to_strftime(format: &str) -> String {
         const POSTGRES_FORMAT_TO_STRFTIME: &[(&str, &str)] = &[
             ("FMHH24", "%-H"),
@@ -3227,6 +3214,193 @@ impl TSQLDialect {
         }
     }
 
+    fn push_postgres_to_char_literal(result: &mut String, ch: char) {
+        if matches!(
+            ch,
+            'F' | 'H'
+                | 'K'
+                | 'M'
+                | 'd'
+                | 'f'
+                | 'g'
+                | 'h'
+                | 'm'
+                | 's'
+                | 't'
+                | 'y'
+                | 'z'
+                | '%'
+                | ':'
+                | '/'
+                | '"'
+                | '\''
+                | '\\'
+        ) {
+            result.push('\\');
+        }
+        result.push(ch);
+    }
+
+    fn classify_postgres_to_char_format(format: &str) -> PostgresToCharFormat {
+        const SUPPORTED: &[(&str, &str, bool)] = &[
+            ("FMHH24", "%-H", false),
+            ("FMHH12", "%-I", false),
+            ("FMHH", "%-I", false),
+            ("FMMonth", "%B", true),
+            ("FMMon", "%b", true),
+            ("FMDay", "%A", true),
+            ("FMDy", "%a", true),
+            ("TMMonth", "%B", false),
+            ("TMMon", "%b", false),
+            ("TMDay", "%A", false),
+            ("TMDy", "%a", false),
+            ("YYYY", "%Y", false),
+            ("yyyy", "%Y", false),
+            ("HH24", "%H", false),
+            ("HH12", "%I", false),
+            ("FMDD", "%-d", false),
+            ("FMMM", "%-m", false),
+            ("FMMI", "%-M", false),
+            ("FMSS", "%-S", false),
+            ("HH", "%I", false),
+            ("YY", "%y", false),
+            ("yy", "%y", false),
+            ("MM", "%m", false),
+            ("mm", "%m", false),
+            ("DD", "%d", false),
+            ("dd", "%d", false),
+            ("MI", "%M", false),
+            ("mi", "%M", false),
+            ("SS", "%S", false),
+            ("ss", "%S", false),
+            ("US", "%f", false),
+            ("Dy", "%a", true),
+            ("Mon", "%b", true),
+        ];
+        const POSTGRES_TOKENS: &[&str] = &[
+            "SSSSS", "SSSS", "IYYY", "IDDD", "MONTH", "Month", "month", "HH24", "HH12", "FMMONTH",
+            "FMMonth", "FMmonth", "FMDAY", "FMDay", "FMday", "FMMON", "FMMon", "FMmon", "FMDY",
+            "FMDy", "FMdy", "TMMonth", "TMMon", "TMDay", "TMDy", "Y,YYY", "A.M.", "a.m.", "P.M.",
+            "p.m.", "FMRM", "FMrm", "IYY", "YYY", "yyyy", "YYYY", "DDD", "ddd", "DAY", "Day",
+            "day", "MON", "Mon", "mon", "DY", "Dy", "dy", "TZH", "TZM", "FF1", "FF2", "FF3", "FF4",
+            "FF5", "FF6", "FMHH24", "FMHH12", "FMHH", "FMDDD", "FMDD", "FMMM", "FMMI", "FMSS",
+            "HH", "IY", "YY", "yy", "MM", "mm", "DD", "dd", "MI", "mi", "SS", "ss", "MS", "US",
+            "AM", "am", "PM", "pm", "BC", "bc", "AD", "ad", "B.C.", "b.c.", "A.D.", "a.d.", "ID",
+            "WW", "ww", "IW", "CC", "RM", "rm", "TZ", "tz", "OF", "I", "Y", "y", "D", "d", "W",
+            "J", "Q",
+        ];
+
+        fn longest_token_at(input: &str, index: usize) -> Option<usize> {
+            POSTGRES_TOKENS
+                .iter()
+                .filter(|token| input[index..].starts_with(**token))
+                .map(|token| token.len())
+                .max()
+        }
+
+        let mut result = String::with_capacity(format.len() * 2);
+        let mut index = 0;
+        let mut requires_english_culture = false;
+
+        while index < format.len() {
+            if format[index..].starts_with('\\') {
+                index += 1;
+                if format[index..].starts_with('"') {
+                    Self::push_postgres_to_char_literal(&mut result, '"');
+                    index += 1;
+                } else {
+                    // Outside double-quoted strings, PostgreSQL only treats a
+                    // backslash as special when it escapes a double quote.
+                    Self::push_postgres_to_char_literal(&mut result, '\\');
+                }
+                continue;
+            }
+
+            if format[index..].starts_with('"') {
+                index += 1;
+                let mut closed = false;
+                while index < format.len() {
+                    let Some(ch) = format[index..].chars().next() else {
+                        return PostgresToCharFormat::Unsupported;
+                    };
+                    index += ch.len_utf8();
+                    if ch == '"' {
+                        closed = true;
+                        break;
+                    }
+                    if ch == '\\' && index < format.len() {
+                        let Some(escaped) = format[index..].chars().next() else {
+                            return PostgresToCharFormat::Unsupported;
+                        };
+                        index += escaped.len_utf8();
+                        Self::push_postgres_to_char_literal(&mut result, escaped);
+                    } else {
+                        Self::push_postgres_to_char_literal(&mut result, ch);
+                    }
+                }
+                if !closed {
+                    return PostgresToCharFormat::Unsupported;
+                }
+                continue;
+            }
+
+            let remaining = &format[index..];
+            let ch = remaining
+                .chars()
+                .next()
+                .expect("format index should be on a character boundary");
+            if matches!(ch, '9' | '0')
+                || ["PR", "SG", "PL", "RN", "EEEE"].iter().any(|token| {
+                    remaining
+                        .get(..token.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(token))
+                })
+            {
+                return PostgresToCharFormat::Numeric;
+            }
+
+            let supported = SUPPORTED
+                .iter()
+                .filter(|(token, _, _)| format[index..].starts_with(token))
+                .max_by_key(|(token, _, _)| token.len());
+            let recognized_len =
+                if format[index..].starts_with("FM") || format[index..].starts_with("TM") {
+                    longest_token_at(format, index + 2).map(|len| len + 2)
+                } else {
+                    longest_token_at(format, index)
+                };
+
+            if let Some((token, replacement, english_culture)) = supported {
+                if recognized_len.is_some_and(|len| len > token.len()) {
+                    return PostgresToCharFormat::Unsupported;
+                }
+                let end = index + token.len();
+                if format[end..].starts_with("TH")
+                    || format[end..].starts_with("th")
+                    || format[end..].starts_with("SP")
+                {
+                    return PostgresToCharFormat::Unsupported;
+                }
+                result.push_str(replacement);
+                requires_english_culture |= english_culture;
+                index = end;
+                continue;
+            }
+
+            if recognized_len.is_some() || format[index..].starts_with("FX") {
+                return PostgresToCharFormat::Unsupported;
+            }
+
+            Self::push_postgres_to_char_literal(&mut result, ch);
+            index += ch.len_utf8();
+        }
+
+        PostgresToCharFormat::Temporal {
+            strftime: result,
+            requires_english_culture,
+        }
+    }
+
     fn formatted_time_to_str_or_fallback(
         mut args: Vec<Expression>,
         original_name: &str,
@@ -3234,20 +3408,33 @@ impl TSQLDialect {
         let this = args.remove(0);
         let format = args.remove(0);
         if let Some(format_string) = Self::literal_string(&format).map(str::to_owned) {
-            if Self::is_explicitly_numeric_expression(&this)
-                || Self::is_postgres_numeric_to_char_format(&format_string)
-            {
+            if Self::is_explicitly_numeric_expression(&this) {
                 return Ok(Expression::Function(Box::new(Function::new(
                     original_name.to_string(),
                     vec![this, format],
                 ))));
             }
 
+            let (format_string, requires_english_culture) =
+                match Self::classify_postgres_to_char_format(&format_string) {
+                    PostgresToCharFormat::Temporal {
+                        strftime,
+                        requires_english_culture,
+                    } => (strftime, requires_english_culture),
+                    PostgresToCharFormat::Numeric | PostgresToCharFormat::Unsupported => {
+                        return Ok(Expression::Function(Box::new(Function::new(
+                            original_name.to_string(),
+                            vec![this, format],
+                        ))));
+                    }
+                };
+
             Ok(Expression::TimeToStr(Box::new(
                 crate::expressions::TimeToStr {
                     this: Box::new(this),
-                    format: Self::postgres_format_to_strftime(&format_string),
-                    culture: None,
+                    format: format_string,
+                    culture: requires_english_culture
+                        .then(|| Box::new(Expression::string("en-US"))),
                     zone: None,
                 },
             )))

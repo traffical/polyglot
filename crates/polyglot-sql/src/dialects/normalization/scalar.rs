@@ -77,7 +77,7 @@ pub(super) enum Action {
     StrPositionExpand,
     CurrentUserSparkParens,
     ConcatCoalesceWrap,
-    PostgresSingleValueConcatToTsql,
+    PostgresConcatToTsql,
     CbrtToPower,
     MinMaxToLeastGreatest,
     Nvl2Expand,
@@ -11536,7 +11536,7 @@ pub(super) fn rewrite(
                 }
             }
 
-            Action::PostgresSingleValueConcatToTsql => {
+            Action::PostgresConcatToTsql => {
                 let mut function = if let Expression::Function(f) = e {
                     *f
                 } else {
@@ -11548,9 +11548,14 @@ pub(super) fn rewrite(
                     Ok(Expression::Function(Box::new(function)))
                 } else {
                     let separator = function.args.remove(0);
-                    let value = function.args.remove(0);
-                    function.name = "CONCAT".to_string();
-                    function.args = vec![value, Expression::string("")];
+
+                    if function.args.len() == 1 {
+                        function.name = "CONCAT".to_string();
+                        function.args.push(Expression::string(""));
+                    } else {
+                        function.args.insert(0, separator.clone());
+                    }
+
                     let concat = Expression::Function(Box::new(function));
 
                     if matches!(separator, Expression::Literal(_)) {

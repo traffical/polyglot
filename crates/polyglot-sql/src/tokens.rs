@@ -1507,6 +1507,9 @@ pub struct TokenizerConfig {
     /// When true (BigQuery), 0xA is tokenized as HexNumber (integer in hex notation).
     /// When false (SQLite, Teradata), 0xCC is tokenized as HexString (binary/blob value).
     pub hex_string_is_integer_type: bool,
+    /// Whether an empty 0x/0X prefix is a valid binary string literal.
+    /// Used by T-SQL, where `0x` represents an empty binary string.
+    pub allow_empty_hex_string: bool,
     /// Whether string escape sequences (like \') are allowed in raw strings.
     /// When true (BigQuery default), \' inside r'...' escapes the quote.
     /// When false (Spark/Databricks), backslashes in raw strings are always literal.
@@ -1556,6 +1559,7 @@ impl Default for TokenizerConfig {
             identifiers_can_start_with_digit: false,
             hex_number_strings: false,
             hex_string_is_integer_type: false,
+            allow_empty_hex_string: false,
             // Default: backslash escapes ARE allowed in raw strings (sqlglot default)
             // Spark/Databricks set this to false
             string_escapes_allowed_in_raw_strings: true,
@@ -3014,11 +3018,19 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
                         self.advance();
                     }
                 }
-                if self.current > hex_start {
+                let has_hex_digits = self.current > hex_start;
+                let next_is_identifier_part = {
+                    let next = self.peek();
+                    next.is_alphanumeric() || matches!(next, '_' | '$' | '#' | '@')
+                };
+                let is_empty_hex_string = self.config.allow_empty_hex_string
+                    && !self.config.hex_string_is_integer_type
+                    && !next_is_identifier_part;
+                if has_hex_digits || is_empty_hex_string {
                     // Check for hex float: 0xABC.DEFpEXP or 0xABCpEXP
                     let mut is_hex_float = false;
                     // Optional fractional part: .hexdigits
-                    if !self.is_at_end() && self.peek() == '.' {
+                    if has_hex_digits && !self.is_at_end() && self.peek() == '.' {
                         let after_dot = if self.current + 1 < self.size {
                             self.char_at(self.current + 1)
                         } else {
@@ -3035,7 +3047,10 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
                         }
                     }
                     // Optional binary exponent: p/P [+/-] digits
-                    if !self.is_at_end() && (self.peek() == 'p' || self.peek() == 'P') {
+                    if has_hex_digits
+                        && !self.is_at_end()
+                        && (self.peek() == 'p' || self.peek() == 'P')
+                    {
                         is_hex_float = true;
                         self.advance(); // consume p/P
                         if !self.is_at_end() && (self.peek() == '+' || self.peek() == '-') {

@@ -1918,13 +1918,13 @@ pub(super) fn normalize(
                                 && matches!(source, DialectType::PostgreSQL)
                                 && matches!(target, DialectType::TSQL | DialectType::Fabric) =>
                             {
-                                Action::Scalar(scalar::Action::PostgresSingleValueConcatToTsql)
+                                Action::Scalar(scalar::Action::PostgresConcatToTsql)
                             }
-                            "CONCAT_WS" if f.args.len() == 2
+                            "CONCAT_WS" if f.args.len() >= 2
                                 && matches!(source, DialectType::PostgreSQL)
                                 && matches!(target, DialectType::TSQL | DialectType::Fabric) =>
                             {
-                                Action::Scalar(scalar::Action::PostgresSingleValueConcatToTsql)
+                                Action::Scalar(scalar::Action::PostgresConcatToTsql)
                             }
                             "ARBITRARY" | "AGGREGATE"
                             | "REGEXP_MATCHES" | "REGEXP_FULL_MATCH"

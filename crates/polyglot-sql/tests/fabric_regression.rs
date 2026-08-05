@@ -27,6 +27,20 @@ fn tsql_to_fabric(sql: &str) -> String {
         .expect("expected at least one statement")
 }
 
+fn round_trip_fabric(sql: &str) -> String {
+    let mut expressions = parse(sql, DialectType::Fabric)
+        .unwrap_or_else(|error| panic!("Fabric parse failed for {sql:?}: {error}"));
+    assert_eq!(expressions.len(), 1, "expected one statement for {sql:?}");
+
+    let dialect = Dialect::get(DialectType::Fabric);
+    let expression = dialect
+        .transform(expressions.remove(0))
+        .unwrap_or_else(|error| panic!("Fabric transform failed for {sql:?}: {error}"));
+    dialect
+        .generate(&expression)
+        .unwrap_or_else(|error| panic!("Fabric generation failed for {sql:?}: {error}"))
+}
+
 #[test]
 fn postgres_json_operators_map_to_valid_fabric_json_functions() {
     let cases = [
@@ -389,6 +403,32 @@ fn postgres_bytea_hex_literals_map_to_fabric_binary_literals() {
     for (sql, expected) in cases {
         assert_eq!(pg_to_fabric_strict(sql), expected, "failed for {sql}");
     }
+
+    let source = "SELECT sha512('\\x'::bytea) FROM t";
+    let expected = "SELECT HASHBYTES('SHA2_512', 0x) FROM t";
+    let first_pass = pg_to_fabric_strict(source);
+
+    assert_eq!(first_pass, expected);
+    assert_eq!(round_trip_fabric(&first_pass), expected);
+    assert_eq!(round_trip_fabric("SELECT 0x"), "SELECT 0x");
+}
+
+#[test]
+fn issue_388_fabric_negated_like_preserves_typed_operands_on_roundtrip() {
+    let source = r"SELECT '\x616263'::bytea NOT LIKE '\x5f625f'::bytea";
+    let expected = "SELECT CAST(CASE WHEN NOT 0x616263 LIKE 0x5f625f THEN 1 WHEN NOT NOT 0x616263 LIKE 0x5f625f THEN 0 ELSE NULL END AS BIT)";
+    let first_pass = pg_to_fabric_strict(source);
+
+    assert_eq!(first_pass, expected);
+    assert_eq!(round_trip_fabric(&first_pass), expected);
+
+    for sql in [
+        "SELECT NOT 0x616263 LIKE 0x5f625f",
+        "SELECT NOT NOT 0x616263 LIKE 0x5f625f",
+        "SELECT NOT [select] LIKE 'x'",
+    ] {
+        assert_eq!(round_trip_fabric(sql), sql, "failed for {sql}");
+    }
 }
 
 #[test]
@@ -500,6 +540,12 @@ fn postgres_string_semantics_without_fabric_equivalent_fail_in_strict_mode() {
 fn postgres_math_functions_without_fabric_equivalent_fail_in_strict_mode() {
     let cases = [
         ("SELECT erf(x)", "ERF"),
+        ("SELECT sinh(x)", "SINH"),
+        ("SELECT cosh(x)", "COSH"),
+        ("SELECT tanh(x)", "TANH"),
+        ("SELECT asinh(x)", "ASINH"),
+        ("SELECT acosh(x)", "ACOSH"),
+        ("SELECT atanh(x)", "ATANH"),
         ("SELECT gcd(12, 8)", "GCD"),
         ("SELECT lcm(4, 6)", "LCM"),
         ("SELECT width_bucket(5, 0, 10, 5)", "WIDTH_BUCKET"),
@@ -838,6 +884,43 @@ fn postgres_to_timestamp_and_to_date_formats_map_to_valid_fabric_convert_signatu
 }
 
 #[test]
+fn postgres_to_date_literals_respect_fabric_date_domain() {
+    for sql in [
+        "SELECT to_date('-44-02-01', 'YYYY-MM-DD')",
+        "SELECT to_date('0000-02-01', 'YYYY-MM-DD')",
+        "SELECT to_date('10000-02-01', 'YYYY-MM-DD')",
+        "SELECT to_date('02/01/0000', 'MM/DD/YYYY')",
+        "SELECT to_date('00000201', 'YYYYMMDD')",
+    ] {
+        let err = Dialect::get(DialectType::PostgreSQL)
+            .transpile_with(sql, DialectType::Fabric, TranspileOptions::strict())
+            .expect_err("strict mode should reject an out-of-range PostgreSQL TO_DATE literal");
+        assert!(
+            err.to_string()
+                .contains("outside the T-SQL/Fabric DATE range"),
+            "unexpected error for {sql}: {err}"
+        );
+    }
+
+    for (sql, expected) in [
+        (
+            "SELECT to_date('0001-01-01', 'YYYY-MM-DD')",
+            "SELECT CONVERT(DATE, '0001-01-01', 23)",
+        ),
+        (
+            "SELECT to_date('9999-12-31', 'YYYY-MM-DD')",
+            "SELECT CONVERT(DATE, '9999-12-31', 23)",
+        ),
+        (
+            "SELECT to_date(date_text, 'YYYY-MM-DD') FROM t",
+            "SELECT CONVERT(DATE, date_text, 23) FROM t",
+        ),
+    ] {
+        assert_eq!(pg_to_fabric_strict(sql), expected, "failed for {sql}");
+    }
+}
+
+#[test]
 fn postgres_make_time_maps_to_fabric_timefromparts_without_losing_fractional_seconds() {
     let cases = [
         (
@@ -892,11 +975,27 @@ fn postgres_to_char_formats_map_to_fabric_dotnet_format_strings() {
         ),
         (
             "SELECT to_char(ts, 'YYYY-MM-DD HH24:MI:SS.US') AS c FROM t",
-            "SELECT FORMAT(ts, 'yyyy-MM-dd HH:mm:ss.ffffff') AS c FROM t",
+            "SELECT FORMAT(ts, 'yyyy-MM-dd HH\\:mm\\:ss.ffffff') AS c FROM t",
         ),
         (
             "SELECT to_char(ts, 'YYYY-MM-DD'::text) AS c FROM t",
             "SELECT FORMAT(ts, 'yyyy-MM-dd') AS c FROM t",
+        ),
+        (
+            "SELECT to_char(ts, 'FMDay FMDy FMMonth FMMon Dy Mon') AS c FROM t",
+            "SELECT FORMAT(ts, 'dddd ddd MMMM MMM ddd MMM', 'en-US') AS c FROM t",
+        ),
+        (
+            "SELECT to_char(ts, 'TMDay TMDy TMMonth TMMon') AS c FROM t",
+            "SELECT FORMAT(ts, 'dddd ddd MMMM MMM') AS c FROM t",
+        ),
+        (
+            r#"SELECT to_char(ts, '"test" YYYY') AS c FROM t"#,
+            "SELECT FORMAT(ts, '\\te\\s\\t yyyy') AS c FROM t",
+        ),
+        (
+            r#"SELECT to_char(ts, '"f\"oo"YYYY') AS c FROM t"#,
+            "SELECT FORMAT(ts, '\\f\\\"ooyyyy') AS c FROM t",
         ),
     ];
 
@@ -907,14 +1006,49 @@ fn postgres_to_char_formats_map_to_fabric_dotnet_format_strings() {
 }
 
 #[test]
+fn postgres_unsupported_named_to_char_formats_fail_for_fabric_in_strict_mode() {
+    let cases = [
+        "SELECT to_char(TIMESTAMP '2012-12-12 12:00', 'DAY Day day DY Dy dy MONTH Month month RM MON Mon mon')",
+        "SELECT to_char(TIMESTAMP '2012-12-12 12:00', 'FMDAY FMDay FMday FMMONTH FMMonth FMmonth FMRM')",
+        "SELECT to_char(ts, 'YYYY MONTH') FROM t",
+    ];
+
+    for sql in cases {
+        let fallback = pg_to_fabric(sql);
+        assert!(
+            fallback.contains("TO_CHAR("),
+            "default mode should preserve the complete unsupported TO_CHAR call for {sql}: {fallback}"
+        );
+
+        let err = Dialect::get(DialectType::PostgreSQL)
+            .transpile_with(sql, DialectType::Fabric, TranspileOptions::strict())
+            .expect_err("strict mode should reject unsupported PostgreSQL named TO_CHAR formats");
+
+        assert!(
+            err.to_string().contains("PostgreSQL TO_CHAR"),
+            "unexpected error for {sql}: {err}"
+        );
+    }
+}
+
+#[test]
 fn postgres_numeric_to_char_formats_fail_for_fabric_in_strict_mode() {
     let cases = [
         "SELECT to_char(val, '9G999G999') FROM t",
         "SELECT to_char(val, '9G999G999'::text) FROM t",
         "SELECT to_char(123, 'S')",
+        r#"SELECT to_char(val, 'f\"oo999') FROM t"#,
+        r#"SELECT to_char(val, 'f\\"oo999') FROM t"#,
+        r#"SELECT to_char(val, '"f\"oo"999') FROM t"#,
     ];
 
     for sql in cases {
+        let fallback = pg_to_fabric(sql);
+        assert!(
+            fallback.contains("TO_CHAR("),
+            "default mode should preserve the unsupported PostgreSQL numeric TO_CHAR call for {sql}: {fallback}"
+        );
+
         let err = Dialect::get(DialectType::PostgreSQL)
             .transpile_with(sql, DialectType::Fabric, TranspileOptions::strict())
             .expect_err("strict mode should reject PostgreSQL numeric TO_CHAR formats");
@@ -954,7 +1088,7 @@ fn postgres_format_string_interpolation_maps_to_fabric_concat() {
 }
 
 #[test]
-fn postgres_single_value_concat_functions_map_to_valid_fabric_sql() {
+fn postgres_concat_functions_preserve_fabric_semantics() {
     let cases = [
         ("SELECT concat('one')", "SELECT CONCAT('one', '')"),
         ("SELECT concat(1)", "SELECT CONCAT(1, '')"),
@@ -973,6 +1107,14 @@ fn postgres_single_value_concat_functions_map_to_valid_fabric_sql() {
         (
             "SELECT concat_ws('#', 'one', 'two')",
             "SELECT CONCAT_WS('#', 'one', 'two')",
+        ),
+        (
+            "SELECT concat_ws(NULL, 10, 20, NULL, 30) IS NULL",
+            "SELECT CAST(CASE WHEN CASE WHEN NULL IS NULL THEN NULL ELSE CONCAT_WS(NULL, 10, 20, NULL, 30) END IS NULL THEN 1 ELSE 0 END AS BIT)",
+        ),
+        (
+            "SELECT concat_ws(separator, 10, 20, NULL, 30) FROM t",
+            "SELECT CASE WHEN separator IS NULL THEN NULL ELSE CONCAT_WS(separator, 10, 20, NULL, 30) END FROM t",
         ),
     ];
 
@@ -1176,6 +1318,53 @@ fn postgres_comma_lateral_maps_to_fabric_cross_apply() {
         pg_to_fabric("SELECT o.id, t.v FROM orders o, LATERAL (SELECT v FROM lineitem WHERE l_orderkey = o.id) t"),
         "SELECT o.id, t.v FROM orders AS o CROSS APPLY (SELECT v FROM lineitem WHERE l_orderkey = o.id) AS t"
     );
+}
+
+#[test]
+fn issue_391_postgres_lateral_aggregate_outer_references_are_validated_for_fabric() {
+    let invalid = [
+        concat!(
+            "SELECT o.f1 AS s1, ss.s2, ss.sm FROM int4_tbl o, LATERAL (",
+            "SELECT i.f1 AS s2, SUM(o.f1 + i.f1) AS sm FROM int4_tbl i GROUP BY i.f1",
+            ") ss"
+        ),
+        concat!(
+            "SELECT o.f1, ss.sm FROM int4_tbl o LEFT JOIN LATERAL (",
+            "SELECT SUM(o.f1 + i.f1) AS sm FROM int4_tbl i",
+            ") ss ON true"
+        ),
+    ];
+
+    for sql in invalid {
+        let error = Dialect::get(DialectType::PostgreSQL)
+            .transpile_with(sql, DialectType::Fabric, TranspileOptions::strict())
+            .expect_err("strict mode should reject invalid outer-reference aggregates in APPLY");
+        assert!(
+            error.to_string().contains(
+                "APPLY aggregate expressions that combine an outer reference with another column reference"
+            ),
+            "unexpected error for {sql}: {error}"
+        );
+    }
+
+    let valid = [
+        concat!(
+            "SELECT o.f1, ss.f1 FROM int4_tbl o, LATERAL (",
+            "SELECT i.f1 FROM int4_tbl i WHERE i.f1 < o.f1",
+            ") ss"
+        ),
+        concat!(
+            "SELECT o.f1, ss.sm FROM int4_tbl o, LATERAL (",
+            "SELECT SUM(i.f1) AS sm FROM int4_tbl i",
+            ") ss"
+        ),
+    ];
+
+    for sql in valid {
+        let generated = pg_to_fabric_strict(sql);
+        parse(&generated, DialectType::Fabric)
+            .unwrap_or_else(|error| panic!("generated Fabric SQL did not reparse: {error}"));
+    }
 }
 
 #[test]
@@ -2042,10 +2231,23 @@ fn postgres_aggregate_filters_map_to_fabric_conditional_aggregates() {
             "SELECT sum(v) FILTER (WHERE x > 5) OVER (PARTITION BY g) AS s FROM t",
             "SELECT SUM(CASE WHEN x > 5 THEN v END) OVER (PARTITION BY g) AS s FROM t",
         ),
+        (
+            "SELECT max(0) FILTER (WHERE b1) FROM (SELECT q > 0 AS b1 FROM t) s",
+            "SELECT MAX(CASE WHEN b1 <> 0 THEN 0 END) FROM (SELECT CAST(CASE WHEN q > 0 THEN 1 WHEN NOT q > 0 THEN 0 ELSE NULL END AS BIT) AS b1 FROM t) AS s",
+        ),
+        (
+            "SELECT sum(v) FILTER (WHERE b1 AND b2) FROM (SELECT v, q > 0 AS b1, r > 0 AS b2 FROM t) s",
+            "SELECT SUM(CASE WHEN b1 <> 0 AND b2 <> 0 THEN v END) FROM (SELECT v, CAST(CASE WHEN q > 0 THEN 1 WHEN NOT q > 0 THEN 0 ELSE NULL END AS BIT) AS b1, CAST(CASE WHEN r > 0 THEN 1 WHEN NOT r > 0 THEN 0 ELSE NULL END AS BIT) AS b2 FROM t) AS s",
+        ),
     ];
 
     for (sql, expected) in cases {
         assert_eq!(pg_to_fabric(sql), expected, "failed for {sql}");
+        assert_eq!(
+            pg_to_fabric_strict(sql),
+            expected,
+            "strict failed for {sql}"
+        );
     }
 }
 
@@ -2149,10 +2351,31 @@ fn postgres_grouped_ordered_set_percentiles_map_to_fabric_windows() {
             "SELECT store_id, percentile_cont(0.5) WITHIN GROUP (ORDER BY pick_seconds) AS med, percentile_disc(0.9) WITHIN GROUP (ORDER BY pick_seconds DESC) AS p90 FROM order_fulfillment_history GROUP BY store_id",
             "SELECT DISTINCT store_id, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY pick_seconds) OVER (PARTITION BY store_id) AS med, PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY pick_seconds DESC) OVER (PARTITION BY store_id) AS p90 FROM order_fulfillment_history",
         ),
+        (
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY q1) FROM t GROUP BY q2",
+            "SELECT _polyglot_grouped_percentile._polyglot_projection_0 AS percentile_cont FROM (SELECT DISTINCT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q1) OVER (PARTITION BY q2) AS _polyglot_projection_0, q2 AS _polyglot_group_0 FROM t) AS _polyglot_grouped_percentile",
+        ),
+        (
+            "SELECT q2 AS bucket, percentile_cont(0.5) WITHIN GROUP (ORDER BY q1) AS med, percentile_disc(0.9) WITHIN GROUP (ORDER BY q1 DESC) AS p90 FROM t GROUP BY q2, q3",
+            "SELECT _polyglot_grouped_percentile._polyglot_projection_0 AS bucket, _polyglot_grouped_percentile._polyglot_projection_1 AS med, _polyglot_grouped_percentile._polyglot_projection_2 AS p90 FROM (SELECT DISTINCT q2 AS _polyglot_projection_0, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q1) OVER (PARTITION BY q2, q3) AS _polyglot_projection_1, PERCENTILE_DISC(0.9) WITHIN GROUP (ORDER BY q1 DESC) OVER (PARTITION BY q2, q3) AS _polyglot_projection_2, q2 AS _polyglot_group_0, q3 AS _polyglot_group_1 FROM t) AS _polyglot_grouped_percentile",
+        ),
+        (
+            "SELECT DISTINCT percentile_cont(0.5) WITHIN GROUP (ORDER BY q1) AS med FROM t GROUP BY q2",
+            "SELECT DISTINCT _polyglot_grouped_percentile._polyglot_projection_0 AS med FROM (SELECT DISTINCT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q1) OVER (PARTITION BY q2) AS _polyglot_projection_0, q2 AS _polyglot_group_0 FROM t) AS _polyglot_grouped_percentile",
+        ),
+        (
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY q1) AS med FROM t GROUP BY q2 ORDER BY q2 DESC LIMIT 2",
+            "SELECT TOP 2 _polyglot_grouped_percentile._polyglot_projection_0 AS med FROM (SELECT DISTINCT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q1) OVER (PARTITION BY q2) AS _polyglot_projection_0, q2 AS _polyglot_group_0 FROM t) AS _polyglot_grouped_percentile ORDER BY CASE WHEN _polyglot_grouped_percentile._polyglot_group_0 IS NULL THEN 1 ELSE 0 END DESC, _polyglot_grouped_percentile._polyglot_group_0 DESC",
+        ),
+        (
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY q1) AS _polyglot_projection_0 FROM _polyglot_grouped_percentile GROUP BY q2",
+            "SELECT _polyglot_grouped_percentile_2._polyglot_projection_0_2 AS _polyglot_projection_0 FROM (SELECT DISTINCT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY q1) OVER (PARTITION BY q2) AS _polyglot_projection_0_2, q2 AS _polyglot_group_0 FROM _polyglot_grouped_percentile) AS _polyglot_grouped_percentile_2",
+        ),
     ];
 
     for (sql, expected) in cases {
         assert_eq!(pg_to_fabric_strict(sql), expected, "failed for {sql}");
+        assert_eq!(pg_to_fabric(sql), expected, "default mode failed for {sql}");
     }
 }
 

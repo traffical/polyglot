@@ -327,8 +327,11 @@ fn grouping_set_expansion_error(target: DialectType) -> Error {
 ///
 /// PostgreSQL allows `PERCENTILE_CONT/DISC(p) WITHIN GROUP (...)` as grouped
 /// aggregates. T-SQL and Fabric expose the same functions as window functions,
-/// so the equivalent row-per-group shape is `SELECT DISTINCT ... OVER
-/// (PARTITION BY group_key)` rather than `GROUP BY`.
+/// so the equivalent row-per-group shape uses an analytic percentile over the
+/// grouping keys. When all grouping keys are projected, `SELECT DISTINCT ...
+/// OVER (PARTITION BY group_key)` is sufficient. Otherwise a derived table
+/// retains the hidden grouping keys during deduplication and an outer SELECT
+/// restores the original projection shape.
 pub fn grouped_percentiles_to_tsql_windows(expr: Expression) -> Result<Expression> {
     transform_recursive(expr, &grouped_percentiles_to_tsql_windows_inner)
 }
@@ -338,12 +341,12 @@ fn grouped_percentiles_to_tsql_windows_inner(expr: Expression) -> Result<Express
         return Ok(expr);
     };
 
-    rewrite_grouped_percentile_select(*select).map(|select| Expression::Select(Box::new(select)))
+    rewrite_grouped_percentile_select(*select)
 }
 
-fn rewrite_grouped_percentile_select(select: Select) -> Result<Select> {
+fn rewrite_grouped_percentile_select(mut select: Select) -> Result<Expression> {
     let Some(group_by) = &select.group_by else {
-        return Ok(select);
+        return Ok(Expression::Select(Box::new(select)));
     };
 
     if select.having.is_some()
@@ -352,10 +355,11 @@ fn rewrite_grouped_percentile_select(select: Select) -> Result<Select> {
         || group_by.expressions.is_empty()
         || group_by.expressions.iter().any(is_complex_grouping_expr)
     {
-        return Ok(select);
+        return Ok(Expression::Select(Box::new(select)));
     }
 
     let partition_by = group_by.expressions.clone();
+    let original_expressions = select.expressions.clone();
     let mut changed = false;
     let mut rewritten_expressions = Vec::with_capacity(select.expressions.len());
 
@@ -367,7 +371,7 @@ fn rewrite_grouped_percentile_select(select: Select) -> Result<Select> {
 
         let Some(rewritten) = rewrite_grouped_percentile_projection(expression, &partition_by)
         else {
-            return Ok(select);
+            return Ok(Expression::Select(Box::new(select)));
         };
 
         changed = true;
@@ -375,14 +379,28 @@ fn rewrite_grouped_percentile_select(select: Select) -> Result<Select> {
     }
 
     if !changed {
-        return Ok(select);
+        return Ok(Expression::Select(Box::new(select)));
     }
 
-    let mut rewritten = select;
-    rewritten.expressions = rewritten_expressions;
-    rewritten.group_by = None;
-    rewritten.distinct = true;
-    Ok(rewritten)
+    let all_grouping_keys_projected = partition_by.iter().all(|group_expr| {
+        original_expressions
+            .iter()
+            .any(|projection| is_projection_of_group_expr(projection, group_expr))
+    });
+
+    if all_grouping_keys_projected {
+        select.expressions = rewritten_expressions;
+        select.group_by = None;
+        select.distinct = true;
+        return Ok(Expression::Select(Box::new(select)));
+    }
+
+    rewrite_grouped_percentile_select_with_hidden_groups(
+        select,
+        original_expressions,
+        rewritten_expressions,
+        partition_by,
+    )
 }
 
 fn is_complex_grouping_expr(expr: &Expression) -> bool {
@@ -393,12 +411,316 @@ fn is_complex_grouping_expr(expr: &Expression) -> bool {
 }
 
 fn is_group_projection(expr: &Expression, group_by: &[Expression]) -> bool {
-    let inner = match expr {
-        Expression::Alias(alias) => &alias.this,
-        other => other,
-    };
+    let inner = unalias_expression(expr);
 
     group_by.iter().any(|group_expr| inner == group_expr)
+}
+
+fn is_projection_of_group_expr(projection: &Expression, group_expr: &Expression) -> bool {
+    unalias_expression(projection) == group_expr
+}
+
+fn unalias_expression(expr: &Expression) -> &Expression {
+    match expr {
+        Expression::Alias(alias) => &alias.this,
+        other => other,
+    }
+}
+
+fn rewrite_grouped_percentile_select_with_hidden_groups(
+    mut inner: Select,
+    original_expressions: Vec<Expression>,
+    rewritten_expressions: Vec<Expression>,
+    group_by: Vec<Expression>,
+) -> Result<Expression> {
+    let original_distinct = inner.distinct;
+
+    let mut used_column_names = original_expressions
+        .iter()
+        .filter_map(grouped_percentile_output_identifier)
+        .map(|identifier| identifier.name)
+        .collect::<Vec<_>>();
+    let projection_aliases = (0..rewritten_expressions.len())
+        .map(|index| {
+            Identifier::new(fresh_grouped_percentile_name(
+                &mut used_column_names,
+                &format!("_polyglot_projection_{index}"),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let group_aliases = (0..group_by.len())
+        .map(|index| {
+            Identifier::new(fresh_grouped_percentile_name(
+                &mut used_column_names,
+                &format!("_polyglot_group_{index}"),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    let mut used_source_names = Vec::new();
+    if let Some(from) = &inner.from {
+        for source in &from.expressions {
+            collect_grouped_percentile_source_names(source, &mut used_source_names);
+        }
+    }
+    for join in &inner.joins {
+        collect_grouped_percentile_source_names(&join.this, &mut used_source_names);
+    }
+    let derived_alias = Identifier::new(fresh_grouped_percentile_name(
+        &mut used_source_names,
+        "_polyglot_grouped_percentile",
+    ));
+
+    let mut inner_expressions = rewritten_expressions
+        .into_iter()
+        .zip(&projection_aliases)
+        .map(|(expression, alias)| {
+            Expression::Alias(Box::new(Alias::new(
+                take_alias_expression(expression),
+                alias.clone(),
+            )))
+        })
+        .collect::<Vec<_>>();
+    inner_expressions.extend(group_by.iter().cloned().zip(&group_aliases).map(
+        |(expression, alias)| Expression::Alias(Box::new(Alias::new(expression, alias.clone()))),
+    ));
+
+    let outer_order_by = inner.order_by.take();
+    let outer_with = inner.with.take();
+    let outer_top = inner.top.take();
+    let outer_limit = inner.limit.take();
+    let outer_offset = inner.offset.take();
+    let outer_limit_by = inner.limit_by.take();
+    let outer_fetch = inner.fetch.take();
+    let outer_distribute_by = inner.distribute_by.take();
+    let outer_cluster_by = inner.cluster_by.take();
+    let outer_sort_by = inner.sort_by.take();
+    let outer_settings = inner.settings.take();
+    let outer_format = inner.format.take();
+    let outer_hint = inner.hint.take();
+    let outer_into = inner.into.take();
+    let outer_locks = std::mem::take(&mut inner.locks);
+    let outer_for_xml = std::mem::take(&mut inner.for_xml);
+    let outer_for_json = std::mem::take(&mut inner.for_json);
+    let outer_leading_comments = std::mem::take(&mut inner.leading_comments);
+    let outer_post_select_comments = std::mem::take(&mut inner.post_select_comments);
+    let outer_kind = inner.kind.take();
+    let outer_operation_modifiers = std::mem::take(&mut inner.operation_modifiers);
+    let outer_option = inner.option.take();
+    let outer_exclude = inner.exclude.take();
+
+    inner.expressions = inner_expressions;
+    inner.group_by = None;
+    inner.distinct = true;
+
+    let outer_expressions = original_expressions
+        .iter()
+        .zip(&projection_aliases)
+        .map(|(original, internal_alias)| {
+            let reference = grouped_percentile_derived_column(&derived_alias, internal_alias);
+            match original {
+                Expression::Alias(alias) => {
+                    let mut outer_alias = alias.as_ref().clone();
+                    outer_alias.this = reference;
+                    Expression::Alias(Box::new(outer_alias))
+                }
+                _ => grouped_percentile_output_identifier(original)
+                    .map_or(reference.clone(), |output_alias| {
+                        Expression::Alias(Box::new(Alias::new(reference, output_alias)))
+                    }),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let outer_order_by = outer_order_by
+        .map(|mut order_by| {
+            for ordered in &mut order_by.expressions {
+                ordered.this = rewrite_grouped_percentile_outer_reference(
+                    std::mem::replace(
+                        &mut ordered.this,
+                        Expression::Null(crate::expressions::Null),
+                    ),
+                    &original_expressions,
+                    &projection_aliases,
+                    &group_by,
+                    &group_aliases,
+                    &derived_alias,
+                )?;
+            }
+            Ok(order_by)
+        })
+        .transpose()?;
+
+    let subquery = Subquery {
+        this: Expression::Select(Box::new(inner)),
+        alias: Some(derived_alias),
+        column_aliases: Vec::new(),
+        alias_explicit_as: true,
+        alias_keyword: None,
+        order_by: None,
+        limit: None,
+        offset: None,
+        distribute_by: None,
+        sort_by: None,
+        cluster_by: None,
+        lateral: false,
+        modifiers_inside: false,
+        trailing_comments: Vec::new(),
+        inferred_type: None,
+    };
+
+    let mut outer = Select::new();
+    outer.expressions = outer_expressions;
+    outer.from = Some(From {
+        expressions: vec![Expression::Subquery(Box::new(subquery))],
+    });
+    outer.distinct = original_distinct;
+    outer.with = outer_with;
+    outer.order_by = outer_order_by;
+    outer.top = outer_top;
+    outer.limit = outer_limit;
+    outer.offset = outer_offset;
+    outer.limit_by = outer_limit_by;
+    outer.fetch = outer_fetch;
+    outer.distribute_by = outer_distribute_by;
+    outer.cluster_by = outer_cluster_by;
+    outer.sort_by = outer_sort_by;
+    outer.settings = outer_settings;
+    outer.format = outer_format;
+    outer.hint = outer_hint;
+    outer.into = outer_into;
+    outer.locks = outer_locks;
+    outer.for_xml = outer_for_xml;
+    outer.for_json = outer_for_json;
+    outer.leading_comments = outer_leading_comments;
+    outer.post_select_comments = outer_post_select_comments;
+    outer.kind = outer_kind;
+    outer.operation_modifiers = outer_operation_modifiers;
+    outer.option = outer_option;
+    outer.exclude = outer_exclude;
+
+    Ok(Expression::Select(Box::new(outer)))
+}
+
+fn take_alias_expression(expression: Expression) -> Expression {
+    match expression {
+        Expression::Alias(alias) => alias.this,
+        other => other,
+    }
+}
+
+fn grouped_percentile_output_identifier(expression: &Expression) -> Option<Identifier> {
+    match expression {
+        Expression::Alias(alias) if !alias.alias.is_empty() => Some(alias.alias.clone()),
+        Expression::Column(column) => Some(column.name.clone()),
+        Expression::Identifier(identifier) => Some(identifier.clone()),
+        Expression::Function(function) => Some(if function.quoted {
+            Identifier::quoted(function.name.clone())
+        } else {
+            Identifier::new(function.name.to_ascii_lowercase())
+        }),
+        Expression::AggregateFunction(function) => {
+            Some(Identifier::new(function.name.to_ascii_lowercase()))
+        }
+        Expression::WithinGroup(within_group) => {
+            grouped_percentile_output_identifier(&within_group.this)
+        }
+        Expression::PercentileCont(_) => Some(Identifier::new("percentile_cont")),
+        Expression::PercentileDisc(_) => Some(Identifier::new("percentile_disc")),
+        _ => None,
+    }
+}
+
+fn fresh_grouped_percentile_name(used_names: &mut Vec<String>, base: &str) -> String {
+    let mut suffix = 1;
+    loop {
+        let candidate = if suffix == 1 {
+            base.to_string()
+        } else {
+            format!("{base}_{suffix}")
+        };
+        if !used_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(&candidate))
+        {
+            used_names.push(candidate.clone());
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn collect_grouped_percentile_source_names(expression: &Expression, names: &mut Vec<String>) {
+    match expression {
+        Expression::Alias(alias) if !alias.alias.is_empty() => names.push(alias.alias.name.clone()),
+        Expression::Subquery(subquery) => {
+            if let Some(alias) = &subquery.alias {
+                names.push(alias.name.clone());
+            }
+        }
+        Expression::Table(table) => {
+            names.push(table.alias.as_ref().unwrap_or(&table.name).name.clone())
+        }
+        _ => {}
+    }
+}
+
+fn grouped_percentile_derived_column(
+    derived_alias: &Identifier,
+    column_alias: &Identifier,
+) -> Expression {
+    Expression::qualified_column(derived_alias.name.clone(), column_alias.name.clone())
+}
+
+fn rewrite_grouped_percentile_outer_reference(
+    expression: Expression,
+    original_expressions: &[Expression],
+    projection_aliases: &[Identifier],
+    group_by: &[Expression],
+    group_aliases: &[Identifier],
+    derived_alias: &Identifier,
+) -> Result<Expression> {
+    transform_recursive(expression, &|node| {
+        if let Some((_, alias)) =
+            original_expressions
+                .iter()
+                .zip(projection_aliases)
+                .find(|(original, _)| {
+                    unalias_expression(original) == &node
+                        || grouped_percentile_output_identifier(original).is_some_and(
+                            |identifier| expression_references_identifier(&node, &identifier),
+                        )
+                })
+        {
+            return Ok(grouped_percentile_derived_column(derived_alias, alias));
+        }
+
+        if let Some((_, alias)) = group_by
+            .iter()
+            .zip(group_aliases)
+            .find(|(group_expr, _)| *group_expr == &node)
+        {
+            return Ok(grouped_percentile_derived_column(derived_alias, alias));
+        }
+
+        Ok(node)
+    })
+}
+
+fn expression_references_identifier(expression: &Expression, identifier: &Identifier) -> bool {
+    let referenced = match expression {
+        Expression::Column(column) if column.table.is_none() => Some(&column.name),
+        Expression::Identifier(referenced) => Some(referenced),
+        _ => None,
+    };
+
+    referenced.is_some_and(|referenced| {
+        if referenced.quoted || identifier.quoted {
+            referenced.name == identifier.name
+        } else {
+            referenced.name.eq_ignore_ascii_case(&identifier.name)
+        }
+    })
 }
 
 fn rewrite_grouped_percentile_projection(

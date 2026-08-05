@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.8.1] - 2026-08-05
+
+### Fixed
+- PostgreSQL boolean values referenced by aggregate `FILTER` predicates now
+  become valid T-SQL/Fabric predicates, including derived `BIT` columns used
+  directly or through `AND`/`OR`, instead of producing target error 4145.
+- Grouped PostgreSQL `PERCENTILE_CONT` and `PERCENTILE_DISC` rewrites now retain
+  unprojected grouping keys in a derived table while preserving projection
+  aliases, `DISTINCT`, ordering, row limits, and collision-free generated names
+  for T-SQL/Fabric.
+- PostgreSQL `VALUES` operands in nested or multi-arm set operations once again
+  become parenthesized T-SQL/Fabric derived tables after parser
+  canonicalization, avoiding invalid `SELECT * FROM VALUES ...` output.
+- T-SQL/Fabric binary literal parsing now accepts the valid empty `0x` value,
+  and negated `LIKE` parse/transform/generate round trips preserve typed
+  hexadecimal operands instead of dropping their `0x` prefixes.
+- PostgreSQL temporal `TO_CHAR` rewrites now handle supported named day/month
+  tokens, .NET time separators, quoted text, and backslash-escaped literals
+  correctly for T-SQL/Fabric. Incompatible named or escaped numeric format
+  models remain unchanged in default mode and fail safely in strict mode.
+- Strict PostgreSQL-to-T-SQL/Fabric transpilation now rejects unsupported
+  `SINH`, `COSH`, `TANH`, `ASINH`, `ACOSH`, and `ATANH` calls instead of
+  emitting nonexistent target functions.
+- Strict PostgreSQL-to-T-SQL/Fabric transpilation now rejects aggregates inside
+  `LATERAL`/`APPLY` queries when an aggregate argument illegally mixes outer-
+  and inner-scope column references, while preserving valid correlated forms.
+- PostgreSQL `CONCAT_WS` now preserves null-separator semantics for
+  T-SQL/Fabric by returning `NULL` when the separator expression is `NULL`
+  rather than treating it as an empty string.
+- Strict PostgreSQL `TO_DATE` rewrites now reject literal years outside the
+  T-SQL/Fabric `DATE` range of 1 through 9999, while retaining supported
+  boundary values and nonliteral inputs.
+
 ## [0.8.0] - 2026-08-04
 
 ### Added

@@ -28945,7 +28945,14 @@ impl Parser {
             let raw_start = self.current;
             self.skip();
             let expr = self.parse_not()?;
-            if matches!(expr, Expression::Like(_) | Expression::ILike(_)) {
+            let preserve_typed_not_like = matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::TSQL)
+                    | Some(crate::dialects::DialectType::Fabric)
+            );
+            if matches!(expr, Expression::Like(_) | Expression::ILike(_))
+                && !preserve_typed_not_like
+            {
                 Ok(Expression::Raw(Raw {
                     sql: self.tokens_to_sql(raw_start, self.current),
                 }))

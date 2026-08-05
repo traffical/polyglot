@@ -4244,6 +4244,15 @@ impl Dialect {
         }
 
         let mut diagnostics = Vec::new();
+        if matches!(source, DialectType::PostgreSQL | DialectType::CockroachDB)
+            && matches!(target, DialectType::TSQL | DialectType::Fabric)
+            && Self::tsql_apply_has_invalid_outer_aggregate(expr)
+        {
+            Self::push_unsupported_diagnostic(
+                &mut diagnostics,
+                "APPLY aggregate expressions that combine an outer reference with another column reference",
+            );
+        }
         let structural_grouping_tuples =
             if matches!(source, DialectType::PostgreSQL | DialectType::CockroachDB)
                 && matches!(target, DialectType::TSQL | DialectType::Fabric)
@@ -5091,22 +5100,8 @@ impl Dialect {
         }
     }
 
-    fn node_has_qualified_whole_row_aggregate_argument(expr: &Expression) -> bool {
-        fn contains_qualified_star(expr: &Expression) -> bool {
-            match expr {
-                Expression::Star(star) => star.table.is_some(),
-                // A star projected by an embedded query is not an argument of
-                // the surrounding aggregate (for example, inside EXISTS).
-                Expression::Select(_)
-                | Expression::Subquery(_)
-                | Expression::Union(_)
-                | Expression::Intersect(_)
-                | Expression::Except(_) => false,
-                _ => expr.children().into_iter().any(contains_qualified_star),
-            }
-        }
-
-        let is_aggregate = matches!(
+    fn node_is_aggregate_function(expr: &Expression) -> bool {
+        matches!(
             expr,
             Expression::AggregateFunction(_)
                 | Expression::Count(_)
@@ -5162,9 +5157,218 @@ impl Dialect {
                 | Expression::HashAgg(_)
                 | Expression::ObjectAgg(_)
                 | Expression::AIAgg(_)
-        );
+        )
+    }
 
-        is_aggregate && expr.children().into_iter().any(contains_qualified_star)
+    fn node_has_qualified_whole_row_aggregate_argument(expr: &Expression) -> bool {
+        fn contains_qualified_star(expr: &Expression) -> bool {
+            match expr {
+                Expression::Star(star) => star.table.is_some(),
+                // A star projected by an embedded query is not an argument of
+                // the surrounding aggregate (for example, inside EXISTS).
+                Expression::Select(_)
+                | Expression::Subquery(_)
+                | Expression::Union(_)
+                | Expression::Intersect(_)
+                | Expression::Except(_) => false,
+                _ => expr.children().into_iter().any(contains_qualified_star),
+            }
+        }
+
+        Self::node_is_aggregate_function(expr)
+            && expr.children().into_iter().any(contains_qualified_star)
+    }
+
+    fn tsql_apply_has_invalid_outer_aggregate(expr: &Expression) -> bool {
+        // SQL Server error 8124: if an aggregate expression contains an outer
+        // reference, that reference must be the only column used by the expression.
+        fn collect_source_names(expr: &Expression, names: &mut HashSet<String>) {
+            let mut insert = |name: &Identifier| {
+                if !name.name.is_empty() {
+                    names.insert(name.name.to_ascii_lowercase());
+                }
+            };
+
+            match expr {
+                Expression::Table(table) => {
+                    insert(table.alias.as_ref().unwrap_or(&table.name));
+                }
+                Expression::Subquery(subquery) => {
+                    if let Some(alias) = &subquery.alias {
+                        insert(alias);
+                    }
+                }
+                Expression::Alias(alias) => insert(&alias.alias),
+                Expression::JoinedTable(joined) => {
+                    if let Some(alias) = &joined.alias {
+                        insert(alias);
+                    } else {
+                        collect_source_names(&joined.left, names);
+                        for join in &joined.joins {
+                            collect_source_names(&join.this, names);
+                        }
+                    }
+                }
+                Expression::Paren(paren) => collect_source_names(&paren.this, names),
+                Expression::Pivot(pivot) => {
+                    if let Some(alias) = &pivot.alias {
+                        insert(alias);
+                    } else {
+                        collect_source_names(&pivot.this, names);
+                    }
+                }
+                Expression::Unpivot(unpivot) => {
+                    if let Some(alias) = &unpivot.alias {
+                        insert(alias);
+                    } else {
+                        collect_source_names(&unpivot.this, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn collect_columns<'a>(
+            expr: &'a Expression,
+            columns: &mut Vec<&'a crate::expressions::Column>,
+        ) {
+            match expr {
+                Expression::Column(column) => columns.push(column),
+                // Query expressions introduce a new name-resolution scope. Their
+                // columns are checked when their own SELECT node is visited.
+                Expression::Select(_)
+                | Expression::Subquery(_)
+                | Expression::Union(_)
+                | Expression::Intersect(_)
+                | Expression::Except(_) => {}
+                _ => {
+                    for child in expr.children() {
+                        collect_columns(child, columns);
+                    }
+                }
+            }
+        }
+
+        fn same_column(
+            left: &crate::expressions::Column,
+            right: &crate::expressions::Column,
+        ) -> bool {
+            let same_identifier =
+                |left: &Identifier, right: &Identifier| left.name.eq_ignore_ascii_case(&right.name);
+
+            same_identifier(&left.name, &right.name)
+                && match (&left.table, &right.table) {
+                    (Some(left), Some(right)) => same_identifier(left, right),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+
+        fn aggregate_is_invalid(expr: &Expression, local_sources: &HashSet<String>) -> bool {
+            let mut columns = Vec::new();
+            collect_columns(expr, &mut columns);
+
+            let outer_column = columns.iter().copied().find(|column| match &column.table {
+                Some(table) => !local_sources.contains(&table.name.to_ascii_lowercase()),
+                // Without a local source, an unqualified reference in a lateral
+                // query can only resolve against an outer scope.
+                None => local_sources.is_empty(),
+            });
+
+            outer_column
+                .is_some_and(|outer| columns.iter().any(|column| !same_column(outer, column)))
+        }
+
+        fn expression_has_invalid_aggregate(
+            expr: &Expression,
+            local_sources: &HashSet<String>,
+        ) -> bool {
+            if Dialect::node_is_aggregate_function(expr)
+                && aggregate_is_invalid(expr, local_sources)
+            {
+                return true;
+            }
+
+            match expr {
+                Expression::Select(_)
+                | Expression::Subquery(_)
+                | Expression::Union(_)
+                | Expression::Intersect(_)
+                | Expression::Except(_) => false,
+                _ => expr
+                    .children()
+                    .into_iter()
+                    .any(|child| expression_has_invalid_aggregate(child, local_sources)),
+            }
+        }
+
+        fn select_has_invalid_aggregate(select: &Select) -> bool {
+            let mut local_sources = HashSet::new();
+            if let Some(from) = &select.from {
+                for source in &from.expressions {
+                    collect_source_names(source, &mut local_sources);
+                }
+            }
+            for join in &select.joins {
+                collect_source_names(&join.this, &mut local_sources);
+            }
+
+            let invalid =
+                |expr: &Expression| expression_has_invalid_aggregate(expr, &local_sources);
+
+            select.expressions.iter().any(invalid)
+                || select.prewhere.as_ref().is_some_and(invalid)
+                || select
+                    .where_clause
+                    .as_ref()
+                    .is_some_and(|where_clause| invalid(&where_clause.this))
+                || select
+                    .group_by
+                    .as_ref()
+                    .is_some_and(|group_by| group_by.expressions.iter().any(invalid))
+                || select
+                    .having
+                    .as_ref()
+                    .is_some_and(|having| invalid(&having.this))
+                || select
+                    .qualify
+                    .as_ref()
+                    .is_some_and(|qualify| invalid(&qualify.this))
+                || select.order_by.as_ref().is_some_and(|order_by| {
+                    order_by
+                        .expressions
+                        .iter()
+                        .any(|ordered| invalid(&ordered.this))
+                })
+        }
+
+        fn apply_rhs_is_invalid(rhs: &Expression) -> bool {
+            rhs.dfs().any(|node| match node {
+                Expression::Select(select) => select_has_invalid_aggregate(select),
+                _ => false,
+            })
+        }
+
+        fn joins_have_invalid_aggregate(joins: &[Join]) -> bool {
+            joins.iter().any(|join| {
+                matches!(
+                    join.kind,
+                    crate::expressions::JoinKind::CrossApply
+                        | crate::expressions::JoinKind::OuterApply
+                ) && apply_rhs_is_invalid(&join.this)
+            })
+        }
+
+        expr.dfs().any(|node| match node {
+            Expression::Select(select) => joins_have_invalid_aggregate(&select.joins),
+            Expression::JoinedTable(joined) => joins_have_invalid_aggregate(&joined.joins),
+            Expression::Update(update) => {
+                joins_have_invalid_aggregate(&update.table_joins)
+                    || joins_have_invalid_aggregate(&update.from_joins)
+            }
+            Expression::Delete(delete) => joins_have_invalid_aggregate(&delete.joins),
+            _ => false,
+        })
     }
 
     fn target_supports_remaining_unnest(target: DialectType) -> bool {
@@ -5992,6 +6196,18 @@ impl Dialect {
             Some("AGE")
         } else if name.eq_ignore_ascii_case("ERF") {
             Some("ERF")
+        } else if name.eq_ignore_ascii_case("SINH") {
+            Some("SINH")
+        } else if name.eq_ignore_ascii_case("COSH") {
+            Some("COSH")
+        } else if name.eq_ignore_ascii_case("TANH") {
+            Some("TANH")
+        } else if name.eq_ignore_ascii_case("ASINH") {
+            Some("ASINH")
+        } else if name.eq_ignore_ascii_case("ACOSH") {
+            Some("ACOSH")
+        } else if name.eq_ignore_ascii_case("ATANH") {
+            Some("ATANH")
         } else if name.eq_ignore_ascii_case("GCD") {
             Some("GCD")
         } else if name.eq_ignore_ascii_case("LCM") {
@@ -7903,6 +8119,7 @@ impl Dialect {
     }
 
     fn conditional_aggregate_value_for_tsql(filter: Expression, value: Expression) -> Expression {
+        let filter = crate::transforms::ensure_bool_condition(filter);
         Expression::Case(Box::new(crate::expressions::Case {
             operand: None,
             whens: vec![(filter, value)],
@@ -9077,6 +9294,23 @@ impl Dialect {
     fn wrap_tsql_values_set_operand(expr: Expression) -> Expression {
         match expr {
             Expression::Values(values) => Self::tsql_values_as_select(*values),
+            Expression::Select(mut select)
+                if Self::is_parser_wrapped_values_set_operand(&select) =>
+            {
+                let mut from = select.from.take().expect("checked as present");
+                let Expression::Values(values) = from
+                    .expressions
+                    .pop()
+                    .expect("checked as a single VALUES source")
+                else {
+                    unreachable!("checked as a VALUES source");
+                };
+                Self::tsql_values_as_select(*values)
+            }
+            Expression::Annotated(mut annotated) => {
+                annotated.this = Self::wrap_tsql_values_set_operand(annotated.this);
+                Expression::Annotated(annotated)
+            }
             Expression::Union(mut union) => {
                 let left = std::mem::replace(&mut union.left, Expression::Null(Null));
                 let right = std::mem::replace(&mut union.right, Expression::Null(Null));
@@ -9100,6 +9334,28 @@ impl Dialect {
             }
             other => other,
         }
+    }
+
+    #[cfg(feature = "transpile")]
+    fn is_parser_wrapped_values_set_operand(select: &Select) -> bool {
+        let Some(from) = &select.from else {
+            return false;
+        };
+        let [Expression::Values(values)] = from.expressions.as_slice() else {
+            return false;
+        };
+        if !values
+            .alias
+            .as_ref()
+            .is_some_and(|alias| alias.name == "_values")
+        {
+            return false;
+        }
+
+        let mut parser_wrapper = Select::new();
+        parser_wrapper.expressions = vec![Expression::star()];
+        parser_wrapper.from = Some(from.clone());
+        select == &parser_wrapper
     }
 
     #[cfg(feature = "transpile")]

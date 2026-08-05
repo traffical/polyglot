@@ -37627,13 +37627,24 @@ impl Generator {
         let len = bytes.len();
         let mut i = 0;
         while i < len {
-            if bytes[i] == b'%' && i + 1 < len {
+            if bytes[i] == b'\\' && i + 1 < len {
+                // PostgreSQL TO_CHAR literals are marked with a backslash by the
+                // parser so .NET does not interpret reserved format characters.
+                result.push('\\');
+                if bytes[i + 1] == b'\'' {
+                    result.push_str("''");
+                } else {
+                    result.push(bytes[i + 1] as char);
+                }
+                i += 2;
+            } else if bytes[i] == b'%' && i + 1 < len {
                 // Check for non-padded variants (%-X)
                 if bytes[i + 1] == b'-' && i + 2 < len {
                     let replacement = match bytes[i + 2] {
                         b'd' => "d",
                         b'm' => "M",
                         b'H' => "H",
+                        b'I' => "h",
                         b'M' => "m",
                         b'S' => "s",
                         _ => {
@@ -37741,6 +37752,7 @@ impl Generator {
                         b'd' => "dd",
                         b'j' => "DDD",
                         b'H' => "HH",
+                        b'I' => "hh",
                         b'M' => "mm",
                         b'S' => "ss",
                         b'f' => "ffffff",
@@ -37798,6 +37810,76 @@ impl Generator {
         }
     }
 
+    fn postgres_year_is_outside_tsql_range(value: &str, format: &str) -> bool {
+        fn component_is_outside(component: &str, forced_negative: bool) -> bool {
+            let component = component.trim().trim_end_matches(',');
+            let (negative, digits) = match component.as_bytes().first() {
+                Some(b'-') => (true, &component[1..]),
+                Some(b'+') => (false, &component[1..]),
+                _ => (false, component),
+            };
+
+            if forced_negative || negative {
+                return !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
+            }
+
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return false;
+            }
+
+            let significant_digits = digits.trim_start_matches('0');
+            significant_digits.is_empty()
+                || significant_digits.len() > 4
+                || significant_digits
+                    .parse::<u16>()
+                    .is_ok_and(|year| year > 9999)
+        }
+
+        let value = value.trim();
+        let format = format.trim();
+
+        if format.starts_with("%Y") {
+            let bytes = value.as_bytes();
+            let digit_start = usize::from(matches!(bytes.first(), Some(b'-' | b'+')));
+            let available_digits = bytes[digit_start..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+            if available_digits == 0 {
+                return false;
+            }
+
+            let digit_count = if format.starts_with("%Y%") {
+                available_digits.min(4)
+            } else {
+                available_digits
+            };
+            return component_is_outside(&value[..digit_start + digit_count], false);
+        }
+
+        if let Some(year_index) = format
+            .split_whitespace()
+            .position(|component| component == "%Y")
+        {
+            if let Some(component) = value.split_whitespace().nth(year_index) {
+                return component_is_outside(component, false);
+            }
+        }
+
+        if format.ends_with("%Y") {
+            for delimiter in ['/', '.', '-'] {
+                if format.ends_with(&format!("{delimiter}%Y")) {
+                    if let Some((prefix, component)) = value.rsplit_once(delimiter) {
+                        let forced_negative = delimiter == '-' && prefix.ends_with('-');
+                        return component_is_outside(component, forced_negative);
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
     fn generate_tsql_str_to_temporal(
         &mut self,
         this: &Expression,
@@ -37806,6 +37888,20 @@ impl Generator {
     ) -> Result<()> {
         if let Some(format) = format {
             if let Some(style) = Self::tsql_convert_style_for_strftime(format) {
+                if target_type == "DATE"
+                    && matches!(self.config.source_dialect, Some(DialectType::PostgreSQL))
+                {
+                    if let Expression::Literal(literal) = this {
+                        if let Literal::String(value) = literal.as_ref() {
+                            if Self::postgres_year_is_outside_tsql_range(value, format) {
+                                self.unsupported(
+                                    "PostgreSQL TO_DATE literal is outside the T-SQL/Fabric DATE range 0001-01-01 through 9999-12-31",
+                                )?;
+                            }
+                        }
+                    }
+                }
+
                 self.write_keyword("CONVERT");
                 self.write("(");
                 self.write_keyword(target_type);
@@ -39071,13 +39167,17 @@ impl Generator {
                 self.write(")");
             }
             Some(DialectType::TSQL) | Some(DialectType::Fabric) => {
-                // TSQL: FORMAT(value, format) with .NET-style format
+                // TSQL: FORMAT(value, format[, culture]) with .NET-style format
                 self.write_keyword("FORMAT");
                 self.write("(");
                 self.generate_expression(&e.this)?;
                 self.write(", '");
                 self.write(&Self::strftime_to_tsql_format(&e.format));
                 self.write("'");
+                if let Some(culture) = &e.culture {
+                    self.write(", ");
+                    self.generate_expression(culture)?;
+                }
                 self.write(")");
             }
             Some(DialectType::DuckDB) => {
