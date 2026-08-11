@@ -40,6 +40,9 @@ func TestPublicAPIMatchesCapabilityContract(t *testing.T) {
 	}
 
 	clientType := reflect.TypeOf(&Client{})
+	packageSymbols := map[string]any{
+		"MergeInto": MergeInto,
+	}
 	seen := make(map[string]bool, len(contract.Capabilities))
 	for _, capability := range contract.Capabilities {
 		if seen[capability.ID] {
@@ -59,10 +62,12 @@ func TestPublicAPIMatchesCapabilityContract(t *testing.T) {
 		}
 
 		for _, symbol := range entry.Symbols {
-			if !strings.HasPrefix(symbol, "Client.") {
-				t.Fatalf("capability %q has invalid Go symbol %q", capability.ID, symbol)
+			var exists bool
+			if strings.HasPrefix(symbol, "Client.") {
+				_, exists = clientType.MethodByName(strings.TrimPrefix(symbol, "Client."))
+			} else {
+				_, exists = packageSymbols[symbol]
 			}
-			_, exists := clientType.MethodByName(strings.TrimPrefix(symbol, "Client."))
 			if entry.Status == "unavailable" && exists {
 				t.Fatalf("capability %q: %s unexpectedly exists", capability.ID, symbol)
 			}
