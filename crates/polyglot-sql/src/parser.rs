@@ -3869,7 +3869,7 @@ impl Parser {
                 break;
             }
 
-            // Handle trailing comma (ClickHouse supports trailing commas in SELECT)
+            // Handle trailing commas in SELECT lists for dialects that support them.
             // ClickHouse: `from` after comma is a column name if followed by an operator
             // (e.g., `from + from` or `from in [0]`), comma, or line-end
             let from_is_column = matches!(
@@ -3916,6 +3916,7 @@ impl Parser {
                 || matches!(
                     self.config.dialect,
                     Some(crate::dialects::DialectType::ClickHouse)
+                        | Some(crate::dialects::DialectType::Snowflake)
                 ))
                 && (!from_is_column && self.check_from_keyword()
                     || self.check(TokenType::Where)
@@ -30749,15 +30750,18 @@ impl Parser {
             self.skip(); // consume @
             let expr = self.parse_bitwise_or()?;
             Ok(Expression::Abs(Box::new(UnaryFunc::new(expr))))
-        } else if self.check(TokenType::Prior)
+        } else if matches!(
+            self.config.dialect,
+            Some(crate::dialects::DialectType::Oracle)
+        ) && self.check(TokenType::Prior)
             && !self.check_next(TokenType::As)
             && !self.check_next(TokenType::Comma)
             && !self.check_next(TokenType::RParen)
             && !self.check_next(TokenType::Semicolon)
             && self.current + 1 < self.tokens.len()
         {
-            // Oracle PRIOR expression - references parent row's value in hierarchical queries
-            // Can appear in SELECT list, CONNECT BY, or other expression contexts
+            // Oracle PRIOR expression - references parent row's value in hierarchical queries.
+            // Other dialects only treat PRIOR as an operator in CONNECT BY expressions.
             // Python sqlglot: "PRIOR": lambda self: self.expression(exp.Prior, this=self._parse_bitwise())
             // When followed by AS/comma/rparen/end, treat PRIOR as an identifier (column name)
             self.skip(); // consume PRIOR
@@ -33849,15 +33853,20 @@ impl Parser {
             ) && self.peek().token_type == TokenType::CurrentTime
             {
                 self.skip(); // consume CURRENT_TIME
+                let mut precision = None;
                 if self.match_token(TokenType::LParen) {
-                    // CURRENT_TIME(n) - consume args but ignore precision
+                    // CURRENT_TIME(n) - preserve the precision in Localtime.this.
                     if !self.check(TokenType::RParen) {
-                        let _ = self.parse_function_arguments()?;
+                        precision = self
+                            .parse_function_arguments()?
+                            .into_iter()
+                            .next()
+                            .map(Box::new);
                     }
                     self.expect(TokenType::RParen)?;
                 }
                 return self.maybe_parse_subscript(Expression::Localtime(Box::new(
-                    crate::expressions::Localtime { this: None },
+                    crate::expressions::Localtime { this: precision },
                 )));
             }
             if self.check_next(TokenType::LParen) {
@@ -35209,9 +35218,28 @@ impl Parser {
                 let args = self.parse_function_args_list()?;
                 self.expect(TokenType::RParen)?;
                 let this = args.get(0).cloned().unwrap_or(Expression::Null(Null {}));
-                let format = args.get(1).cloned().map(Box::new);
-                let precision = args.get(2).cloned().map(Box::new);
-                let scale = args.get(3).cloned().map(Box::new);
+                let (format, precision, scale) =
+                    if self.config.dialect == Some(crate::dialects::DialectType::Snowflake)
+                        && args.len() <= 3
+                        && args.get(1).is_some_and(|arg| {
+                            matches!(arg, Expression::Literal(literal) if matches!(literal.as_ref(), Literal::Number(_)))
+                        })
+                    {
+                        // Snowflake's numeric overload is TO_NUMBER(expr, precision, scale).
+                        // Keep it distinct from TO_NUMBER(expr, format[, ...]) so target
+                        // validation can reason about the requested decimal semantics.
+                        (
+                            None,
+                            args.get(1).cloned().map(Box::new),
+                            args.get(2).cloned().map(Box::new),
+                        )
+                    } else {
+                        (
+                            args.get(1).cloned().map(Box::new),
+                            args.get(2).cloned().map(Box::new),
+                            args.get(3).cloned().map(Box::new),
+                        )
+                    };
                 let safe = if spec.canonical_name == "TRY_TO_NUMBER" {
                     Some(Box::new(Expression::Boolean(BooleanLiteral {
                         value: true,
@@ -36821,6 +36849,77 @@ impl Parser {
             "BITOR" | "BITAND" | "BITXOR" | "BITSHIFTLEFT" | "BITSHIFTRIGHT"
         ) {
             return self.parse_generic_function(name, quoted);
+        }
+
+        // Preserve BigQuery-specific semantics until cross-dialect normalization has
+        // selected a target. These functions cannot be treated as anonymous calls:
+        // TIMESTAMP defaults to UTC, SAFE_DIVIDE catches overflow as well as division
+        // by zero, and ROUND uses half-away-from-zero midpoint handling.
+        if !quoted
+            && matches!(
+                self.config.dialect,
+                Some(crate::dialects::DialectType::BigQuery)
+            )
+            && matches!(upper_name, "TIMESTAMP" | "SAFE_DIVIDE" | "ROUND")
+        {
+            let args = self.parse_function_args_list()?;
+            self.expect(TokenType::RParen)?;
+
+            match (upper_name, args.as_slice()) {
+                ("TIMESTAMP", [this]) => {
+                    return Ok(Expression::Timestamp(Box::new(
+                        crate::expressions::TimestampFunc {
+                            this: Some(Box::new(this.clone())),
+                            zone: None,
+                            with_tz: Some(true),
+                            safe: None,
+                        },
+                    )));
+                }
+                ("TIMESTAMP", [this, zone]) => {
+                    return Ok(Expression::Timestamp(Box::new(
+                        crate::expressions::TimestampFunc {
+                            this: Some(Box::new(this.clone())),
+                            zone: Some(Box::new(zone.clone())),
+                            with_tz: Some(true),
+                            safe: None,
+                        },
+                    )));
+                }
+                ("SAFE_DIVIDE", [this, expression]) => {
+                    return Ok(Expression::SafeDivide(Box::new(
+                        crate::expressions::SafeDivide {
+                            this: Box::new(this.clone()),
+                            expression: Box::new(expression.clone()),
+                        },
+                    )));
+                }
+                ("ROUND", [this]) => {
+                    return Ok(Expression::Round(Box::new(crate::expressions::RoundFunc {
+                        this: this.clone(),
+                        decimals: None,
+                    })));
+                }
+                ("ROUND", [this, decimals]) => {
+                    return Ok(Expression::Round(Box::new(crate::expressions::RoundFunc {
+                        this: this.clone(),
+                        decimals: Some(decimals.clone()),
+                    })));
+                }
+                _ => {
+                    return Ok(Expression::Function(Box::new(Function {
+                        name: name.to_string(),
+                        args,
+                        distinct: false,
+                        trailing_comments: Vec::new(),
+                        use_bracket_syntax: false,
+                        no_parens: false,
+                        quoted,
+                        span: None,
+                        inferred_type: None,
+                    })));
+                }
+            }
         }
 
         let canonical_upper_name =

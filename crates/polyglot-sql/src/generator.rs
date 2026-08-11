@@ -3171,7 +3171,14 @@ impl Generator {
             Expression::Div(op) => self.generate_binary_op(op, "/"),
             Expression::IntDiv(f) => {
                 use crate::dialects::DialectType;
-                if matches!(self.config.dialect, Some(DialectType::DuckDB)) {
+                if matches!(self.config.dialect, Some(DialectType::ClickHouse)) {
+                    self.write("intDiv(");
+                    self.generate_expression(&f.this)?;
+                    self.write(", ");
+                    self.generate_expression(&f.expression)?;
+                    self.write(")");
+                    Ok(())
+                } else if matches!(self.config.dialect, Some(DialectType::DuckDB)) {
                     // DuckDB uses // operator for integer division
                     self.generate_expression(&f.this)?;
                     self.write(" // ");
@@ -39156,6 +39163,18 @@ impl Generator {
                 self.write("'");
                 self.write(")");
             }
+            Some(DialectType::Snowflake) => {
+                self.write_keyword("TO_CHAR");
+                self.write("(");
+                self.generate_expression(&e.this)?;
+                self.write(", '");
+                if e.format.contains('%') {
+                    self.write(&Self::strftime_to_snowflake_format(&e.format));
+                } else {
+                    self.write(&e.format);
+                }
+                self.write("')");
+            }
             Some(DialectType::Drill) => {
                 // Drill: TO_CHAR with Java format
                 self.write_keyword("TO_CHAR");
@@ -39189,6 +39208,19 @@ impl Generator {
                 self.write(&e.format);
                 self.write("'");
                 self.write(")");
+            }
+            Some(DialectType::ClickHouse) => {
+                // ClickHouse: formatDateTime(value, strftime_format)
+                let format = if e.format.contains('%') {
+                    e.format.clone()
+                } else {
+                    Self::snowflake_format_to_strftime(&e.format)
+                };
+                self.write("formatDateTime(");
+                self.generate_expression(&e.this)?;
+                self.write(", '");
+                self.write(&format);
+                self.write("')");
             }
             Some(DialectType::BigQuery) => {
                 // BigQuery: FORMAT_DATE(format, value) - note swapped arg order
@@ -39506,7 +39538,27 @@ impl Generator {
 
     fn generate_to_double(&mut self, e: &ToDouble) -> Result<()> {
         // TO_DOUBLE(this, [format])
-        self.write_keyword("TO_DOUBLE");
+        if self.config.dialect == Some(DialectType::ClickHouse)
+            && e.safe.is_some()
+            && e.format.is_none()
+        {
+            self.write("toFloat64OrNull");
+        } else if self.config.dialect == Some(DialectType::DuckDB)
+            && e.safe.is_some()
+            && e.format.is_none()
+        {
+            self.write_keyword("TRY_CAST");
+            self.write("(");
+            self.generate_expression(&e.this)?;
+            self.write_space();
+            self.write_keyword("AS DOUBLE");
+            self.write(")");
+            return Ok(());
+        } else if e.safe.is_some() {
+            self.write_keyword("TRY_TO_DOUBLE");
+        } else {
+            self.write_keyword("TO_DOUBLE");
+        }
         self.write("(");
         self.generate_expression(&e.this)?;
         if let Some(format) = &e.format {
@@ -39542,22 +39594,22 @@ impl Generator {
         }
         self.write("(");
         self.generate_expression(&e.this)?;
-        let precision_is_snowflake_default = e.precision.is_none()
+        let scale_is_snowflake_default = e.scale.is_none()
             || matches!(
-                e.precision.as_deref(),
+                e.scale.as_deref(),
                 Some(Expression::Literal(lit))
                     if matches!(lit.as_ref(), Literal::Number(n) if n == "0")
             );
         let is_snowflake_default_precision =
             matches!(self.config.dialect, Some(DialectType::Snowflake))
                 && e.nlsparam.is_none()
-                && e.scale.is_none()
+                && e.format.is_none()
                 && matches!(
-                    e.format.as_deref(),
+                    e.precision.as_deref(),
                     Some(Expression::Literal(lit))
                         if matches!(lit.as_ref(), Literal::Number(n) if n == "38")
                 )
-                && precision_is_snowflake_default;
+                && scale_is_snowflake_default;
 
         if !is_snowflake_default_precision {
             if let Some(format) = &e.format {

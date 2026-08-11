@@ -1,7 +1,7 @@
 use polyglot_sql_ffi::{
-    polyglot_analyze_query, polyglot_annotate_types, polyglot_dialect_count, polyglot_dialect_list,
-    polyglot_diff, polyglot_format, polyglot_format_with_options, polyglot_free_result,
-    polyglot_free_string, polyglot_free_validation_result, polyglot_generate,
+    polyglot_analyze_query, polyglot_annotate_types, polyglot_build, polyglot_dialect_count,
+    polyglot_dialect_list, polyglot_diff, polyglot_format, polyglot_format_with_options,
+    polyglot_free_result, polyglot_free_string, polyglot_free_validation_result, polyglot_generate,
     polyglot_generate_data_type, polyglot_lineage, polyglot_lineage_at,
     polyglot_lineage_at_with_schema, polyglot_lineage_with_schema,
     polyglot_openlineage_column_lineage, polyglot_openlineage_job_event,
@@ -1532,6 +1532,7 @@ fn test_public_api_matches_capability_contract() {
             polyglot_openlineage_run_event
         },
         "analyze_query" => { polyglot_analyze_query },
+        "builders" => { polyglot_build },
     };
 
     let mut declared_available = BTreeSet::new();

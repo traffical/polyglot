@@ -99,6 +99,30 @@ func integrationLibraryPath(t *testing.T) string {
 	return path
 }
 
+func TestBuilderIntegration(t *testing.T) {
+	client := integrationClient(t)
+	base := Select("x").From("tbl").Where("x > 0")
+	extended := base.Where("x < 9")
+
+	baseSQL, err := client.BuildSQL(base, "generic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	extendedSQL, err := client.BuildSQL(extended, "generic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseSQL != "SELECT x FROM tbl WHERE x > 0" {
+		t.Fatalf("base SQL = %q", baseSQL)
+	}
+	if extendedSQL != "SELECT x FROM tbl WHERE x > 0 AND x < 9" {
+		t.Fatalf("extended SQL = %q", extendedSQL)
+	}
+	if _, err := client.Build(extended); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func integrationSchema() ValidationSchema {
 	nullable := true
 	nonNull := false

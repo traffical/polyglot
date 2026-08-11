@@ -114,6 +114,11 @@ describe('Polyglot SDK', () => {
     assertLayerContract(contract, 'wasm', wasmModule);
   });
 
+  it('exports the compatibility builders from the named and default APIs', () => {
+    expect(sdk.compat.select('x').sql()).toBe('SELECT x');
+    expect(sdk.default.compat.select('y').sql()).toBe('SELECT y');
+  });
+
   describe('init', () => {
     it('should be initialized (synchronous init on import)', () => {
       expect(isInitialized()).toBe(true);

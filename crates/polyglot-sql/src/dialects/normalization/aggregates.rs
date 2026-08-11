@@ -1,4 +1,7 @@
-use super::{NormalizationContext, RewriteOutcome};
+use super::{
+    scalar::{expression_numeric_kind, NumericKind},
+    NormalizationContext, RewriteOutcome,
+};
 use crate::dialects::DialectType;
 use crate::error::Result;
 use crate::expressions::*;
@@ -34,6 +37,7 @@ pub(super) enum Action {
     PercentileContConvert,
     ClickHouseUniqToApproxCountDistinct,
     ClickHouseAnyToAnyValue,
+    SnowflakeMedianToClickHouse,
 }
 
 pub(super) fn rewrite(
@@ -45,6 +49,65 @@ pub(super) fn rewrite(
     let e = expression;
     let expression = (|| -> Result<Expression> {
         match action {
+            Action::SnowflakeMedianToClickHouse => {
+                let mut agg = if let Expression::Median(agg) = e {
+                    *agg
+                } else {
+                    unreachable!("action only triggered for Median expressions")
+                };
+
+                let has_unsupported_modifiers = agg.distinct
+                    || !agg.order_by.is_empty()
+                    || agg.having_max.is_some()
+                    || agg.limit.is_some()
+                    || agg.ignore_nulls == Some(false);
+                if has_unsupported_modifiers {
+                    if context.strict {
+                        return Err(crate::error::Error::unsupported(
+                            "Snowflake MEDIAN modifiers cannot be preserved for ClickHouse",
+                            target.to_string(),
+                        ));
+                    }
+                    return Ok(Expression::Median(Box::new(agg)));
+                }
+
+                let mut input = agg.this;
+                input = match expression_numeric_kind(&input) {
+                    NumericKind::Float => input,
+                    NumericKind::Integer => cast_integer_median_input(input),
+                    NumericKind::Decimal => widen_zero_scale_median_input(input),
+                    NumericKind::Unknown if context.strict => {
+                        return Err(crate::error::Error::unsupported(
+                            "Snowflake MEDIAN with an unresolved input type cannot be preserved",
+                            target.to_string(),
+                        ));
+                    }
+                    NumericKind::Unknown => input,
+                };
+
+                // ClickHouse aggregate functions ignore NULL inputs, so a SQL FILTER
+                // can be preserved by feeding NULL to rows that do not match.
+                if let Some(condition) = agg.filter.take() {
+                    input = Expression::IfFunc(Box::new(IfFunc {
+                        condition,
+                        true_value: input,
+                        false_value: Some(Expression::Null(Null)),
+                        original_name: None,
+                        inferred_type: None,
+                    }));
+                }
+
+                Ok(Expression::AggregateFunction(Box::new(AggregateFunction {
+                    name: "medianExactWeightedInterpolatedOrNull".to_string(),
+                    args: vec![input, Expression::number(1)],
+                    distinct: false,
+                    filter: None,
+                    order_by: Vec::new(),
+                    limit: None,
+                    ignore_nulls: None,
+                    inferred_type: agg.inferred_type,
+                })))
+            }
             Action::ArrayAggCollectList => {
                 let agg = if let Expression::ArrayAgg(a) = e {
                     *a
@@ -1187,4 +1250,52 @@ pub(super) fn rewrite(
     })()?;
 
     Ok(RewriteOutcome::Rewritten(expression))
+}
+
+fn cast_integer_median_input(expression: Expression) -> Expression {
+    Expression::Cast(Box::new(Cast {
+        this: expression,
+        // Snowflake fixed-point numbers have at most 38 digits. One fractional
+        // digit is required so an even-sized integer median can retain `.5`.
+        to: DataType::Decimal {
+            precision: Some(39),
+            scale: Some(1),
+        },
+        trailing_comments: Vec::new(),
+        double_colon_syntax: false,
+        format: None,
+        default: None,
+        inferred_type: None,
+    }))
+}
+
+fn widen_zero_scale_median_input(expression: Expression) -> Expression {
+    let decimal_shape = match &expression {
+        Expression::Cast(cast) | Expression::TryCast(cast) | Expression::SafeCast(cast) => {
+            match &cast.to {
+                DataType::Decimal { precision, scale } => Some((*precision, *scale)),
+                _ => None,
+            }
+        }
+        other => match other.inferred_type() {
+            Some(DataType::Decimal { precision, scale }) => Some((*precision, *scale)),
+            _ => None,
+        },
+    };
+
+    match decimal_shape {
+        Some((precision, scale)) if scale.unwrap_or(0) == 0 => Expression::Cast(Box::new(Cast {
+            this: expression,
+            to: DataType::Decimal {
+                precision: Some(precision.unwrap_or(38).saturating_add(1).min(76)),
+                scale: Some(1),
+            },
+            trailing_comments: Vec::new(),
+            double_colon_syntax: false,
+            format: None,
+            default: None,
+            inferred_type: None,
+        })),
+        _ => expression,
+    }
 }

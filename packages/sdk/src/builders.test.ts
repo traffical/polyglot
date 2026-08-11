@@ -60,6 +60,7 @@ import {
   update,
   upper,
 } from './builders';
+import * as compat from './compat';
 
 // ============================================================================
 // Expression helpers
@@ -759,5 +760,80 @@ describe('End-to-end queries', () => {
     expect(sql).toContain('SET name = t2.name');
     expect(sql).toContain('FROM t2');
     expect(sql).toContain('WHERE t1.id = t2.id');
+  });
+});
+
+describe('SQLGlot-compatible immutable builders', () => {
+  it('parses clause strings and preserves scalar string coercion', () => {
+    const query = compat
+      .select('customer_id', 'COUNT(*) AS orders')
+      .from_('orders')
+      .where("status = 'complete'")
+      .groupBy('customer_id')
+      .orderBy('orders DESC')
+      .limit(10);
+
+    expect(query.sql()).toBe(
+      "SELECT customer_id, COUNT(*) AS orders FROM orders WHERE status = 'complete' GROUP BY customer_id ORDER BY orders DESC LIMIT 10",
+    );
+    expect(compat.column('status').eq('active').sql()).toBe(
+      "status = 'active'",
+    );
+  });
+
+  it('does not mutate the original expression', () => {
+    const base = compat.select('x').from_('tbl').where('x > 0');
+    const extended = base.where('x < 9');
+
+    expect(base.sql()).toBe('SELECT x FROM tbl WHERE x > 0');
+    expect(extended.sql()).toBe('SELECT x FROM tbl WHERE x > 0 AND x < 9');
+  });
+
+  it('supports the shared advanced query and DML feature set', () => {
+    const query = compat
+      .select('department', compat.count(compat.col('id')).as_('employees'))
+      .from_('employees')
+      .join('departments', {
+        on: 'employees.department_id = departments.id',
+        joinType: 'full',
+      })
+      .window('w', {
+        partitionBy: ['department'],
+        orderBy: ['salary DESC'],
+      })
+      .lateralView(compat.func('EXPLODE', compat.col('teams')), {
+        tableAlias: 'team',
+        columnAliases: ['name'],
+        outer: true,
+      })
+      .forShare();
+    expect(query.sql()).toContain('FULL JOIN departments');
+    expect(query.sql()).toContain('WINDOW w AS');
+    expect(query.sql()).toContain('LATERAL VIEW OUTER');
+    expect(query.sql()).toContain('FOR SHARE');
+
+    const ctas = query.ctas('department_summary', {
+      replace: true,
+      temporary: true,
+    });
+    expect(ctas.sql()).toContain('CREATE OR REPLACE TEMPORARY TABLE');
+
+    const merge = compat
+      .mergeInto('target')
+      .mergeUsing('source', 'target.id = source.id')
+      .whenMatchedUpdate({ name: compat.col('source.name') }, 'source.active')
+      .whenMatchedDelete('source.deleted')
+      .whenNotMatchedInsert(['id'], [compat.col('source.id')], 'source.active');
+    expect(merge.sql()).toContain(
+      'WHEN MATCHED AND source.active THEN UPDATE SET name = source.name',
+    );
+  });
+
+  it('uses one append/replacement contract for repeated clauses', () => {
+    const base = compat.select('x').where('x > 0');
+    expect(base.where('x < 10').sql()).toBe('SELECT x WHERE x > 0 AND x < 10');
+    expect(base.where({ append: false }, 'x = 5').sql()).toBe(
+      'SELECT x WHERE x = 5',
+    );
   });
 });
